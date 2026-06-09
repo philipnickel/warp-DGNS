@@ -1,0 +1,342 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: Apache-2.0
+
+"""Sum-factorized interpolation ``B`` for tensor-product elements.
+
+The ``B`` stage of the ``B^T D B`` factorization maps element nodal DOFs to the
+value and *reference* gradient at every quadrature point, one axis at a time,
+contracting against the small 1D interpolation matrix ``I`` and derivative
+matrix ``D_ref`` from :mod:`warp._src.fem.sumfac.operators_1d`.
+
+For a quad element with lexicographic nodal DOFs ``u(i, j)`` (``i`` the slowest
+axis, ``j`` the fastest -- the ordering used by ``warp.fem`` square/cube shape
+functions), the value at quadrature point ``(qx, qy)`` is the separable
+contraction::
+
+    V(qx, qy) = sum_{i, j} A[qx, i] B[qy, j] u(i, j)  ==  A @ U @ B^T,
+
+where ``U`` is the ``(n, n)`` matrix ``U(i, j) = u(i, j)`` and ``n = P + 1``.
+Choosing ``A`` and ``B`` selects the output:
+
+* value:        ``A = I``,     ``B = I``      (``Kron(I, I)``)
+* d/dxi:        ``A = D_ref``, ``B = I``      (``Kron(D_ref, I)``)
+* d/deta:       ``A = I``,     ``B = D_ref``  (``Kron(I, D_ref)``)
+
+The 3D hex case adds a third axis ``k`` (the fastest) and a third operator
+matrix ``C``, with the analogous three-factor contraction
+``sum_{i,j,k} A[qx,i] B[qy,j] C[qz,k] u(i,j,k)``.
+
+Each directional contraction is a small dense matrix product issued with
+:func:`warp.tile_matmul`, so it maps to tensor cores on GPU and to the scalar
+fallback GEMM on CPU. Because the same 1D matrices apply to every element, a
+panel of ``E_b`` elements is contracted together: the first (slowest-axis)
+contraction is a single wide :func:`warp.tile_matmul` over an ``(n, n * E_b)``
+(2D) or ``(n, n^2 * E_b)`` (3D) right-hand side; the remaining axes are folded
+in with per-element, per-slice tile matmuls. ``E_b = 1`` recovers one element
+per block.
+
+These kernels are written to be correct on CPU (``block_dim = 1``, serialized)
+and fast on GPU. ``P``, ``n = P + 1``, ``q``, ``E_b`` and their products are
+baked in as :func:`warp.constant` values so the tile shapes are static and the
+loops unroll.
+"""
+
+from __future__ import annotations
+
+from functools import cache
+
+import numpy as np
+
+import warp as wp
+from warp._src.fem.sumfac.operators_1d import (
+    build_derivative_matrix,
+    build_interpolation_matrix,
+    default_basis_nodes,
+    default_quadrature_points,
+)
+
+__all__ = [
+    "build_operator_arrays",
+    "interpolate_2d",
+    "interpolate_3d",
+    "make_interpolation_kernel_2d",
+    "make_interpolation_kernel_3d",
+    "pack_dofs_2d",
+    "pack_dofs_3d",
+]
+
+
+def build_operator_arrays(degree: int, dtype=np.float64):
+    """Build the 1D interpolation/derivative matrices for a degree-``degree`` element.
+
+    Args:
+        degree: Polynomial degree ``P`` of the element. The basis has ``n = P + 1``
+            nodes and the default quadrature has ``q = n`` points.
+        dtype: NumPy floating-point dtype for the returned matrices.
+
+    Returns:
+        A pair ``(interp, deriv)`` of ``(q, n)`` NumPy arrays, where
+        ``interp[q, a] = L_a(points[q])`` and ``deriv[q, a] = L'_a(points[q])``.
+    """
+    nodes = default_basis_nodes(degree)
+    points = default_quadrature_points(degree)
+    interp = build_interpolation_matrix(nodes, points).astype(dtype)
+    deriv = build_derivative_matrix(nodes, points).astype(dtype)
+    return interp, deriv
+
+
+# -- Host-side packing helpers ------------------------------------------------
+#
+# The contraction kernels read a panel of E_b elements as a single wide tile so
+# the first (slowest-axis) contraction is one wide matmul. The per-element
+# directional matrix is stored with the contracted axis ``i`` as the leading
+# (row) dimension and the remaining axes (plus the batch index) flattened into
+# the columns.
+
+
+def pack_dofs_2d(dofs: np.ndarray, n: int) -> np.ndarray:
+    """Pack ``(num_elements, n*n)`` lexicographic DOFs into the wide ``(n, num_elements*n)`` layout.
+
+    Element ``e`` occupies columns ``[e*n : (e+1)*n]``; within that block the
+    array is ``U_e(i, j) = dofs[e, i*n + j]`` (``i`` the leading row, ``j`` the
+    column).
+    """
+    num_elements = dofs.shape[0]
+    u = np.asarray(dofs).reshape(num_elements, n, n)  # [e, i, j]
+    # move e between i and j -> [i, e, j] -> (n, num_elements*n)
+    return np.ascontiguousarray(u.transpose(1, 0, 2).reshape(n, num_elements * n))
+
+
+def pack_dofs_3d(dofs: np.ndarray, n: int) -> np.ndarray:
+    """Pack ``(num_elements, n^3)`` lexicographic DOFs into the wide ``(n, num_elements*n*n)`` layout.
+
+    Element ``e`` occupies columns ``[e*n*n : (e+1)*n*n]``; within that block the
+    array is ``U_e(i, j*n + k) = dofs[e, i*n*n + j*n + k]`` (``i`` the leading
+    row).
+    """
+    num_elements = dofs.shape[0]
+    u = np.asarray(dofs).reshape(num_elements, n, n * n)  # [e, i, (j,k)]
+    return np.ascontiguousarray(u.transpose(1, 0, 2).reshape(n, num_elements * n * n))
+
+
+# -- Kernel factories ---------------------------------------------------------
+#
+# ``P``, ``n``, ``q``, ``E_b`` and the products needed by tile shapes are baked
+# in as ``wp.constant`` values captured in the closure so the tile dimensions
+# are compile-time constants and the loops unroll. The factories are cached so
+# a given (n, q, E_b, dtype) shape compiles only once.
+
+
+@cache
+def make_interpolation_kernel_2d(n: int, q: int, element_batch: int, dtype):
+    """Build (and cache) the 2D contraction kernel ``out_e = A @ U_e @ B^T``.
+
+    The kernel processes one ``element_batch``-wide panel per launch index. The
+    first contraction (over axis ``i``) is a single wide ``tile_matmul`` over
+    the packed ``(n, element_batch * n)`` panel; the second contraction (over
+    axis ``j``) is one ``tile_matmul`` per element against ``B^T``.
+
+    Args:
+        n: Number of 1D nodes ``P + 1``.
+        q: Number of 1D quadrature points.
+        element_batch: Number of elements per panel ``E_b``.
+        dtype: Warp scalar dtype (e.g. ``wp.float64``).
+
+    Returns:
+        A compiled ``wp.Kernel`` taking ``(A, B, packed, out)`` arrays.
+    """
+    n_c = wp.constant(n)
+    q_c = wp.constant(q)
+    eb_c = wp.constant(element_batch)
+    qq_c = wp.constant(q * q)
+    ebn_c = wp.constant(element_batch * n)
+
+    @wp.kernel
+    def kernel(
+        a_mat: wp.array2d(dtype=dtype),
+        b_mat: wp.array2d(dtype=dtype),
+        packed: wp.array2d(dtype=dtype),
+        out: wp.array2d(dtype=dtype),
+    ):
+        panel = wp.tid()
+
+        a_tile = wp.tile_load(a_mat, shape=(q_c, n_c))
+        b_tile = wp.tile_load(b_mat, shape=(q_c, n_c))
+        b_transpose = wp.tile_transpose(b_tile)
+
+        # Wide first contraction over axis i: (q, n) @ (n, E_b*n) -> (q, E_b*n).
+        rhs = wp.tile_load(packed, shape=(n_c, ebn_c), offset=(0, panel * ebn_c))
+        stage1 = wp.tile_matmul(a_tile, rhs)  # [qx, e*n + j]
+
+        for e in range(eb_c):
+            stage1_e = wp.tile_view(stage1, offset=(0, e * n_c), shape=(q_c, n_c))  # [qx, j]
+            value_e = wp.tile_zeros(shape=(q_c, q_c), dtype=dtype)
+            wp.tile_matmul(stage1_e, b_transpose, value_e)  # (q, q) [qx, qy]
+            value_flat = wp.tile_reshape(value_e, shape=(1, qq_c))
+            wp.tile_store(out, value_flat, offset=(panel * eb_c + e, 0))
+
+    return kernel
+
+
+@cache
+def make_interpolation_kernel_3d(n: int, q: int, element_batch: int, dtype):
+    """Build (and cache) the 3D contraction kernel ``out_e = (A,B,C) . U_e``.
+
+    The kernel processes one ``element_batch``-wide panel per launch index:
+
+    1. Wide first contraction over axis ``i``: one ``tile_matmul`` over the
+       packed ``(n, element_batch * n^2)`` panel.
+    2. Contraction over axis ``j``: per element, per ``qx``-slice, ``B @ slice``.
+    3. Contraction over axis ``k``: per element, per ``qx``-slice, ``slice @ C^T``.
+
+    All intermediate slices are contiguous (offset-only) tile views.
+
+    Args:
+        n: Number of 1D nodes ``P + 1``.
+        q: Number of 1D quadrature points.
+        element_batch: Number of elements per panel ``E_b``.
+        dtype: Warp scalar dtype (e.g. ``wp.float64``).
+
+    Returns:
+        A compiled ``wp.Kernel`` taking ``(A, B, C, packed, out)`` arrays.
+    """
+    n_c = wp.constant(n)
+    q_c = wp.constant(q)
+    eb_c = wp.constant(element_batch)
+    nn_c = wp.constant(n * n)
+    qn_c = wp.constant(q * n)
+    qq_c = wp.constant(q * q)
+    ebnn_c = wp.constant(element_batch * n * n)
+
+    @wp.kernel
+    def kernel(
+        a_mat: wp.array2d(dtype=dtype),
+        b_mat: wp.array2d(dtype=dtype),
+        c_mat: wp.array2d(dtype=dtype),
+        packed: wp.array2d(dtype=dtype),
+        out: wp.array2d(dtype=dtype),
+    ):
+        panel = wp.tid()
+
+        a_tile = wp.tile_load(a_mat, shape=(q_c, n_c))
+        b_tile = wp.tile_load(b_mat, shape=(q_c, n_c))
+        c_tile = wp.tile_load(c_mat, shape=(q_c, n_c))
+        c_transpose = wp.tile_transpose(c_tile)
+
+        # Wide first contraction over axis i: (q, n) @ (n, E_b*n^2) -> (q, E_b*n^2).
+        rhs = wp.tile_load(packed, shape=(n_c, ebnn_c), offset=(0, panel * ebnn_c))
+        stage1 = wp.tile_matmul(a_tile, rhs)  # [qx, e*n^2 + j*n + k]
+
+        for e in range(eb_c):
+            stage1_e = wp.tile_view(stage1, offset=(0, e * nn_c), shape=(q_c, nn_c))  # [qx, j*n + k]
+
+            # Contraction over axis j, per qx-slice. stage2: (q, q*n) [qx, qy*n + k].
+            stage2 = wp.tile_zeros(shape=(q_c, qn_c), dtype=dtype)
+            for qx in range(q_c):
+                row = wp.tile_view(stage1_e, offset=(qx, 0), shape=(1, nn_c))  # [j*n + k]
+                block = wp.tile_reshape(row, shape=(n_c, n_c))  # [j, k]
+                slab = wp.tile_matmul(b_tile, block)  # (q, n) [qy, k]
+                slab_flat = wp.tile_reshape(slab, shape=(1, qn_c))
+                wp.tile_assign(stage2, slab_flat, offset=(qx, 0))
+
+            # Contraction over axis k, per qx-slice. stage3: (q, q*q) [qx, qy*q + qz].
+            for qx in range(q_c):
+                row2 = wp.tile_view(stage2, offset=(qx, 0), shape=(1, qn_c))  # [qy*n + k]
+                block2 = wp.tile_reshape(row2, shape=(q_c, n_c))  # [qy, k]
+                slab2 = wp.tile_matmul(block2, c_transpose)  # (q, q) [qy, qz]
+                slab2_flat = wp.tile_reshape(slab2, shape=(1, qq_c))
+                wp.tile_store(out, slab2_flat, offset=(panel * eb_c + e, qx * qq_c))
+
+    return kernel
+
+
+# -- High-level NumPy drivers -------------------------------------------------
+
+
+def _np_to_wp_dtype(np_dtype):
+    return wp.float32 if np.dtype(np_dtype) == np.float32 else wp.float64
+
+
+def interpolate_2d(dofs, a_mat, b_mat, n, q, element_batch=1, device=None):
+    """Apply the 2D separable contraction ``out_e = A @ U_e @ B^T`` to every element.
+
+    Args:
+        dofs: ``(num_elements, n*n)`` NumPy array of lexicographic nodal DOFs.
+            ``num_elements`` must be a multiple of ``element_batch``.
+        a_mat: ``(q, n)`` operator matrix applied along the slow axis ``i``.
+        b_mat: ``(q, n)`` operator matrix applied along the fast axis ``j``.
+        n: Number of 1D nodes ``P + 1``.
+        q: Number of 1D quadrature points.
+        element_batch: Panel width ``E_b`` (default 1).
+        device: Warp device to run on.
+
+    Returns:
+        A ``(num_elements, q*q)`` NumPy array of interpolated values at the
+        quadrature points, ordered lexicographically ``(qx, qy)``.
+    """
+    dofs = np.ascontiguousarray(dofs)
+    num_elements = dofs.shape[0]
+    if num_elements % element_batch != 0:
+        raise ValueError(f"num_elements ({num_elements}) must be a multiple of element_batch ({element_batch}).")
+
+    np_dtype = dofs.dtype if dofs.dtype in (np.float32, np.float64) else np.float64
+    wp_dtype = _np_to_wp_dtype(np_dtype)
+
+    packed = pack_dofs_2d(dofs.astype(np_dtype), n)
+    a_np = np.ascontiguousarray(a_mat, dtype=np_dtype)
+    b_np = np.ascontiguousarray(b_mat, dtype=np_dtype)
+
+    a_wp = wp.array(a_np, dtype=wp_dtype, device=device)
+    b_wp = wp.array(b_np, dtype=wp_dtype, device=device)
+    packed_wp = wp.array(packed, dtype=wp_dtype, device=device)
+    out_wp = wp.zeros((num_elements, q * q), dtype=wp_dtype, device=device)
+
+    kernel = make_interpolation_kernel_2d(n, q, element_batch, wp_dtype)
+    num_panels = num_elements // element_batch
+    wp.launch_tiled(kernel, dim=[num_panels], inputs=[a_wp, b_wp, packed_wp, out_wp], block_dim=1, device=device)
+    wp.synchronize_device(device)
+    return out_wp.numpy()
+
+
+def interpolate_3d(dofs, a_mat, b_mat, c_mat, n, q, element_batch=1, device=None):
+    """Apply the 3D separable contraction ``out_e = (A, B, C) . U_e`` to every element.
+
+    Args:
+        dofs: ``(num_elements, n^3)`` NumPy array of lexicographic nodal DOFs.
+            ``num_elements`` must be a multiple of ``element_batch``.
+        a_mat: ``(q, n)`` operator matrix applied along the slow axis ``i``.
+        b_mat: ``(q, n)`` operator matrix applied along the middle axis ``j``.
+        c_mat: ``(q, n)`` operator matrix applied along the fast axis ``k``.
+        n: Number of 1D nodes ``P + 1``.
+        q: Number of 1D quadrature points.
+        element_batch: Panel width ``E_b`` (default 1).
+        device: Warp device to run on.
+
+    Returns:
+        A ``(num_elements, q^3)`` NumPy array of interpolated values at the
+        quadrature points, ordered lexicographically ``(qx, qy, qz)``.
+    """
+    dofs = np.ascontiguousarray(dofs)
+    num_elements = dofs.shape[0]
+    if num_elements % element_batch != 0:
+        raise ValueError(f"num_elements ({num_elements}) must be a multiple of element_batch ({element_batch}).")
+
+    np_dtype = dofs.dtype if dofs.dtype in (np.float32, np.float64) else np.float64
+    wp_dtype = _np_to_wp_dtype(np_dtype)
+
+    packed = pack_dofs_3d(dofs.astype(np_dtype), n)
+    a_np = np.ascontiguousarray(a_mat, dtype=np_dtype)
+    b_np = np.ascontiguousarray(b_mat, dtype=np_dtype)
+    c_np = np.ascontiguousarray(c_mat, dtype=np_dtype)
+
+    a_wp = wp.array(a_np, dtype=wp_dtype, device=device)
+    b_wp = wp.array(b_np, dtype=wp_dtype, device=device)
+    c_wp = wp.array(c_np, dtype=wp_dtype, device=device)
+    packed_wp = wp.array(packed, dtype=wp_dtype, device=device)
+    out_wp = wp.zeros((num_elements, q * q * q), dtype=wp_dtype, device=device)
+
+    kernel = make_interpolation_kernel_3d(n, q, element_batch, wp_dtype)
+    num_panels = num_elements // element_batch
+    wp.launch_tiled(kernel, dim=[num_panels], inputs=[a_wp, b_wp, c_wp, packed_wp, out_wp], block_dim=1, device=device)
+    wp.synchronize_device(device)
+    return out_wp.numpy()
