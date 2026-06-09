@@ -39,6 +39,7 @@ from warp._src.fem.integrate import (
     _parse_integrand_arguments,
 )
 from warp._src.fem.sumfac.operators_1d import (
+    build_derivative_matrix,
     build_interpolation_matrix,
     default_basis_nodes,
     default_quadrature_points,
@@ -259,8 +260,6 @@ def run(device):
     nodes_1d = default_basis_nodes(DEGREE)
     interp_np = build_interpolation_matrix(nodes_1d, qpoints_1d)
     # Derivative matrix only feeds the (identically zero) f1 contraction here
-    from warp._src.fem.sumfac.operators_1d import build_derivative_matrix
-
     deriv_np = build_derivative_matrix(nodes_1d, qpoints_1d)
 
     # --- Per-element DOF packing (host-side gather via topology map) -----
