@@ -419,6 +419,53 @@ uv run python warp/examples/fem/bench_sumfac_dg.py           # GPU only — run 
 
 ---
 
+## Phase 6 · Surface sum-factorization (GPU)
+
+**Goal:** Sum-factorize the DG face/flux terms so the complete DG operator (volume + surface)
+runs on the fast path. Quad/hex only.
+
+**Math:** On a hex face normal to axis ``a``, the trace of the tensor-product basis factorizes:
+- **Value trace:** with GLL (endpoint-including) nodes, ``L_i(0) = δ_{i,0}`` and
+  ``L_i(1) = δ_{i,n-1}``, so the face value is simply the boundary **slice** of the DOF tensor —
+  no contraction along the normal axis at all.
+- **Normal-gradient trace:** one extra 1D contraction collapsing the normal axis with the
+  endpoint row of ``D̂`` (``∂u/∂x_a|_face = Σ_i D̂[face_end, i] · u(i, ·)``).
+- The remaining ``d−1`` axes contract exactly like the volume case (1D ``I``/``D̂`` against the
+  face quadrature points), so the face ``B`` stage is an ``E_b``-wide (d−1)-dimensional version
+  of the existing kernels. Flux terms (jump/average) need BOTH the inner and the outer element's
+  traces; the outer element's face is traversed in its own local frame, so the node/QP
+  **permutation between the two frames** must match what the existing side-domain machinery
+  (`Sides`, `element_inner_weight`/`element_outer_weight`) produces — this is the Phase 6 analog
+  of the Phase 1 ordering risk (spec §9.8) and gets its own test before any flux kernel.
+
+### Files
+- **EDIT** `warp/_src/fem/sumfac/tensor_contract.py` (face-trace contraction kernels)
+- **EDIT** `warp/_src/fem/sumfac/qfunction.py` (seeded extraction for side integrands:
+  jump/average operators on SeedFields, inner+outer seeds)
+- **EDIT** `warp/_src/fem/sumfac/kernels.py` (surface apply/assembly factories)
+- **EDIT** `warp/_src/fem/integrate.py` (relax `sumfac_applicable` for qualifying side domains)
+- **EDIT** `warp/tests/fem/test_fem_sumfac_faces.py` (extend with surface sum-fac tests)
+- **EDIT** `CHANGELOG.md`
+
+### Tests to write FIRST
+1. `test_face_trace_ordering`: inner and outer sum-fac traces of a shared face equal the values
+   of `element_inner_weight`/`element_outer_weight`-based evaluation at the actual side QPs
+   (locks the orientation/permutation risk, spec §9.8).
+2. `test_face_value_trace_is_dof_slice`: GLL endpoint property — sum-fac face value == boundary
+   slice of the DOF tensor, P=1..8.
+3. `test_face_normal_gradient_trace`: endpoint-``D̂``-row contraction == dense reference.
+4. `test_surface_apply_equals_naive`: DG flux forms (upwind advection, SIP diffusion penalty)
+   on `Sides` domains — sum-fac apply == naive `integrate()`, 2D & 3D, P up to 8.
+5. `test_end_to_end_dg_fully_sumfac`: convection-diffusion DG example at P≥5 with BOTH volume
+   and surface terms forced onto the sum-fac path matches the legacy solution.
+
+### Acceptance gate
+Surface apply == naive on side domains (CPU + CUDA); the end-to-end DG example at P≥5 runs with
+no naive fallback anywhere (assert via dispatch instrumentation) and matches legacy. Benchmark
+updated: volume+surface speedup curve.
+
+---
+
 ## Cross-cutting: full-suite regression & finalize
 
 After each phase, run the touched FEM tests plus the existing ones to catch regressions:

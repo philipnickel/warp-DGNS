@@ -89,7 +89,8 @@ else:                                                    # value+grad operators 
 
 `sumfac_applicable` is conservative — anything unproven falls through. `integrate()` semantics
 never change. A `warp.fem` config flag forces it on/off for A/B testing. DG **face** integrals
-(side domains) fall back initially; surface sum-fac is a later add-on.
+(side domains) fall back initially (Phase 5); full surface sum-factorization lands in Phase 6 so
+that the complete DG operator (volume + flux terms) runs sum-factorized.
 
 ## 6. Module layout
 
@@ -117,7 +118,8 @@ Self-contained subpackage + small reviewable hooks → contained diff against up
 | **2 · Q-function** | `SeedField` + `qfunction.py` + geometry | extraction matches mass/stiffness/advection coefficients | CPU |
 | **3 · Apply + dispatch** | `kernels.py` apply; `sumfac_applicable` + `integrate.py` hook; matrix-free `LinearOperator` | apply == naive `bsr_mv`; matrix-free DG solve | CPU corr. |
 | **4 · Assembly** | action-on-unit-vectors → BSR | assembled == naive assembly | CPU corr. |
-| **5 · Faces + bench** | surface terms; end-to-end DG; speedup + tensor-core roofline | example reproduced at P≥5; speedup curve | **GPU** |
+| **5 · Face fallback + bench** | face integrals fall back correctly; end-to-end DG; speedup + tensor-core roofline | example reproduced at P≥5; speedup curve | **GPU** |
+| **6 · Surface sum-fac** | face/flux terms sum-factorized: GLL endpoint traces (value = DOF slice, normal grad = endpoint ``D̂`` row), (d−1)-dim tensor-product contraction, inner+outer traces for jumps/averages | face apply == naive on side domains; DG example fully sum-factorized at P≥5 | **GPU** |
 
 Phases 0 and 1 are independent. Phase 3 is the integration gate. **GPU/tensor-core performance
 validation (Phase 5) requires a CUDA machine — not the local CPU-only Mac.**
@@ -152,6 +154,10 @@ against it in-repo.
    GPU-validated.
 6. **Non-affine geometry:** validate affine grids first, then trilinear/curved hexes (per-QP Jacobian in D).
 7. **AD later:** keep ops AD-friendly; `adj_tile_matmul` exists for the backward path.
+8. **Face orientation match (Phase 6):** the inner and outer elements of a shared face traverse it
+   in their own local coordinate frames; the trace contraction must apply the same node/QP
+   permutation that the existing side-domain machinery uses. Silent-correctness risk of the same
+   kind as §9.2 — pin down with a dedicated inner/outer trace-equality test before any flux term.
 
 ## 10. Alternatives considered
 
