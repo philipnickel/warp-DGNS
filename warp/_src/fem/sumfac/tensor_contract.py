@@ -169,7 +169,12 @@ def make_interpolation_kernel_2d(n: int, q: int, element_batch: int, dtype):
         stage1 = wp.tile_matmul(a_tile, rhs)  # [qx, e*n + j]
 
         for e in range(eb_c):
-            stage1_e = wp.tile_view(stage1, offset=(0, e * n_c), shape=(q_c, n_c))  # [qx, j]
+            # The per-element panel slice is strided (row stride E_b*n); copy it into a
+            # contiguous tile first, because the cuBLASDx tile_matmul path assumes packed
+            # operands (no leading dimension is passed to the GEMM).
+            stage1_view = wp.tile_view(stage1, offset=(0, e * n_c), shape=(q_c, n_c))  # [qx, j]
+            stage1_e = wp.tile_zeros(shape=(q_c, n_c), dtype=dtype)
+            wp.tile_assign(stage1_e, stage1_view, offset=(0, 0))
             value_e = wp.tile_zeros(shape=(q_c, q_c), dtype=dtype)
             wp.tile_matmul(stage1_e, b_transpose, value_e)  # (q, q) [qx, qy]
             value_flat = wp.tile_reshape(value_e, shape=(1, qq_c))
@@ -257,6 +262,16 @@ def _np_to_wp_dtype(np_dtype):
     return wp.float32 if np.dtype(np_dtype) == np.float32 else wp.float64
 
 
+def _default_block_dim(device) -> int:
+    """Pick the tile-kernel block size for ``device``.
+
+    CPU tile kernels run serialized with a single thread per block. On CUDA the
+    ``tile_matmul`` cuBLASDx path requires at least a full warp per block; a
+    couple of warps is a safe default for the small matrices used here.
+    """
+    return 1 if wp.get_device(device).is_cpu else 64
+
+
 def interpolate_2d(dofs, a_mat, b_mat, n, q, element_batch=1, device=None):
     """Apply the 2D separable contraction ``out_e = A @ U_e @ B^T`` to every element.
 
@@ -293,7 +308,13 @@ def interpolate_2d(dofs, a_mat, b_mat, n, q, element_batch=1, device=None):
 
     kernel = make_interpolation_kernel_2d(n, q, element_batch, wp_dtype)
     num_panels = num_elements // element_batch
-    wp.launch_tiled(kernel, dim=[num_panels], inputs=[a_wp, b_wp, packed_wp, out_wp], block_dim=1, device=device)
+    wp.launch_tiled(
+        kernel,
+        dim=[num_panels],
+        inputs=[a_wp, b_wp, packed_wp, out_wp],
+        block_dim=_default_block_dim(device),
+        device=device,
+    )
     wp.synchronize_device(device)
     return out_wp.numpy()
 
@@ -337,6 +358,12 @@ def interpolate_3d(dofs, a_mat, b_mat, c_mat, n, q, element_batch=1, device=None
 
     kernel = make_interpolation_kernel_3d(n, q, element_batch, wp_dtype)
     num_panels = num_elements // element_batch
-    wp.launch_tiled(kernel, dim=[num_panels], inputs=[a_wp, b_wp, c_wp, packed_wp, out_wp], block_dim=1, device=device)
+    wp.launch_tiled(
+        kernel,
+        dim=[num_panels],
+        inputs=[a_wp, b_wp, c_wp, packed_wp, out_wp],
+        block_dim=_default_block_dim(device),
+        device=device,
+    )
     wp.synchronize_device(device)
     return out_wp.numpy()
