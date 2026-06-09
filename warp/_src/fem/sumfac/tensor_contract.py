@@ -1,12 +1,15 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Sum-factorized interpolation ``B`` for tensor-product elements.
+"""Sum-factorized contractions ``B`` and ``B^T`` for tensor-product elements.
 
 The ``B`` stage of the ``B^T D B`` factorization maps element nodal DOFs to the
 value and *reference* gradient at every quadrature point, one axis at a time,
 contracting against the small 1D interpolation matrix ``I`` and derivative
-matrix ``D_ref`` from :mod:`warp._src.fem.sumfac.operators_1d`.
+matrix ``D_ref`` from :mod:`warp._src.fem.sumfac.operators_1d`. The ``B^T``
+stage is the exact transpose: it maps per-quadrature-point coefficients back to
+element nodal residuals via the same separable contraction with the transposed
+``(n, q)`` 1D matrices.
 
 For a quad element with lexicographic nodal DOFs ``u(i, j)`` (``i`` the slowest
 axis, ``j`` the fastest -- the ordering used by ``warp.fem`` square/cube shape
@@ -39,6 +42,14 @@ These kernels are written to be correct on CPU (``block_dim = 1``, serialized)
 and fast on GPU. ``P``, ``n = P + 1``, ``q``, ``E_b`` and their products are
 baked in as :func:`warp.constant` values so the tile shapes are static and the
 loops unroll.
+
+The kernel factories and packing helpers are written for **arbitrary**
+``(rows_out, rows_in)`` operator shapes; nothing in them assumes that the
+operator maps nodes to quadrature points. The forward (``B``) drivers pass the
+``(q, n)`` operators on an ``n``-wide packed input; the backward (``B^T``)
+drivers pass the transposed ``(n, q)`` operators on a ``q``-wide packed input.
+One kernel code path therefore serves both directions, and with the default
+``q = n`` quadrature both directions share the same compiled tile shapes.
 """
 
 from __future__ import annotations
@@ -55,8 +66,17 @@ from warp._src.fem.sumfac.operators_1d import (
     default_quadrature_points,
 )
 
+# The contraction kernels do not need autodiff yet (design risk 9.7 defers AD); with backward
+# enabled every tile_matmul builds three GEMM LTOs (forward + two adjoints), tripling the
+# first-run CUDA compile time of every kernel shape. Re-enable when the AD path lands.
+wp.set_module_options({"enable_backward": False})
+
 __all__ = [
     "build_operator_arrays",
+    "contract_transpose_2d",
+    "contract_transpose_3d",
+    "contract_transpose_residual_2d",
+    "contract_transpose_residual_3d",
     "interpolate_2d",
     "interpolate_3d",
     "make_interpolation_kernel_2d",
@@ -136,9 +156,17 @@ def make_interpolation_kernel_2d(n: int, q: int, element_batch: int, dtype):
     the packed ``(n, element_batch * n)`` panel; the second contraction (over
     axis ``j``) is one ``tile_matmul`` per element against ``B^T``.
 
+    The kernel is agnostic to what the per-axis dimensions represent: ``n`` is
+    the per-axis size of the *input* (operator columns) and ``q`` the per-axis
+    size of the *output* (operator rows). The forward ``B`` stage passes
+    ``(q, n)`` node-to-quadrature operators; the transpose ``B^T`` stage reuses
+    this factory with the roles swapped and the transposed ``(n, q)`` operators.
+
     Args:
-        n: Number of 1D nodes ``P + 1``.
-        q: Number of 1D quadrature points.
+        n: Per-axis input size (operator columns); ``P + 1`` nodes in the
+            forward direction.
+        q: Per-axis output size (operator rows); the 1D quadrature point count
+            in the forward direction.
         element_batch: Number of elements per panel ``E_b``.
         dtype: Warp scalar dtype (e.g. ``wp.float64``).
 
@@ -196,9 +224,15 @@ def make_interpolation_kernel_3d(n: int, q: int, element_batch: int, dtype):
 
     All intermediate slices are contiguous (offset-only) tile views.
 
+    As in the 2D factory, ``n`` is the per-axis input size and ``q`` the
+    per-axis output size; the transpose ``B^T`` stage reuses this factory with
+    the roles swapped and the transposed ``(n, q)`` operators.
+
     Args:
-        n: Number of 1D nodes ``P + 1``.
-        q: Number of 1D quadrature points.
+        n: Per-axis input size (operator columns); ``P + 1`` nodes in the
+            forward direction.
+        q: Per-axis output size (operator rows); the 1D quadrature point count
+            in the forward direction.
         element_batch: Number of elements per panel ``E_b``.
         dtype: Warp scalar dtype (e.g. ``wp.float64``).
 
@@ -272,6 +306,63 @@ def _default_block_dim(device) -> int:
     return 1 if wp.get_device(device).is_cpu else 64
 
 
+def _contract(values, operators, rows_in, rows_out, dim, element_batch, device):
+    """Apply the ``dim``-axis separable contraction to every element.
+
+    Generic core shared by the forward (``B``) and transpose (``B^T``) drivers.
+    Each operator in ``operators`` has shape ``(rows_out, rows_in)`` and is
+    applied along one axis (slowest first), so the per-element result is
+    ``Kron(operators...) @ vec(values_e)``.
+
+    Args:
+        values: ``(num_elements, rows_in**dim)`` NumPy array of lexicographic
+            per-element coefficients. ``num_elements`` must be a multiple of
+            ``element_batch``.
+        operators: ``dim`` operator matrices of shape ``(rows_out, rows_in)``,
+            ordered slowest axis first.
+        rows_in: Per-axis input size (operator columns).
+        rows_out: Per-axis output size (operator rows).
+        dim: Spatial dimension (2 or 3).
+        element_batch: Panel width ``E_b``.
+        device: Warp device to run on.
+
+    Returns:
+        A ``(num_elements, rows_out**dim)`` NumPy array, lexicographically
+        ordered (slowest axis first).
+    """
+    values = np.ascontiguousarray(values)
+    num_elements = values.shape[0]
+    if num_elements % element_batch != 0:
+        raise ValueError(f"num_elements ({num_elements}) must be a multiple of element_batch ({element_batch}).")
+
+    np_dtype = values.dtype if values.dtype in (np.float32, np.float64) else np.float64
+    wp_dtype = _np_to_wp_dtype(np_dtype)
+
+    if dim == 2:
+        packed = pack_dofs_2d(values.astype(np_dtype), rows_in)
+        kernel = make_interpolation_kernel_2d(rows_in, rows_out, element_batch, wp_dtype)
+    elif dim == 3:
+        packed = pack_dofs_3d(values.astype(np_dtype), rows_in)
+        kernel = make_interpolation_kernel_3d(rows_in, rows_out, element_batch, wp_dtype)
+    else:
+        raise ValueError(f"Unsupported dimension {dim} (expected 2 or 3).")
+
+    op_wp = [wp.array(np.ascontiguousarray(op, dtype=np_dtype), dtype=wp_dtype, device=device) for op in operators]
+    packed_wp = wp.array(packed, dtype=wp_dtype, device=device)
+    out_wp = wp.zeros((num_elements, rows_out**dim), dtype=wp_dtype, device=device)
+
+    num_panels = num_elements // element_batch
+    wp.launch_tiled(
+        kernel,
+        dim=[num_panels],
+        inputs=[*op_wp, packed_wp, out_wp],
+        block_dim=_default_block_dim(device),
+        device=device,
+    )
+    wp.synchronize_device(device)
+    return out_wp.numpy()
+
+
 def interpolate_2d(dofs, a_mat, b_mat, n, q, element_batch=1, device=None):
     """Apply the 2D separable contraction ``out_e = A @ U_e @ B^T`` to every element.
 
@@ -289,34 +380,7 @@ def interpolate_2d(dofs, a_mat, b_mat, n, q, element_batch=1, device=None):
         A ``(num_elements, q*q)`` NumPy array of interpolated values at the
         quadrature points, ordered lexicographically ``(qx, qy)``.
     """
-    dofs = np.ascontiguousarray(dofs)
-    num_elements = dofs.shape[0]
-    if num_elements % element_batch != 0:
-        raise ValueError(f"num_elements ({num_elements}) must be a multiple of element_batch ({element_batch}).")
-
-    np_dtype = dofs.dtype if dofs.dtype in (np.float32, np.float64) else np.float64
-    wp_dtype = _np_to_wp_dtype(np_dtype)
-
-    packed = pack_dofs_2d(dofs.astype(np_dtype), n)
-    a_np = np.ascontiguousarray(a_mat, dtype=np_dtype)
-    b_np = np.ascontiguousarray(b_mat, dtype=np_dtype)
-
-    a_wp = wp.array(a_np, dtype=wp_dtype, device=device)
-    b_wp = wp.array(b_np, dtype=wp_dtype, device=device)
-    packed_wp = wp.array(packed, dtype=wp_dtype, device=device)
-    out_wp = wp.zeros((num_elements, q * q), dtype=wp_dtype, device=device)
-
-    kernel = make_interpolation_kernel_2d(n, q, element_batch, wp_dtype)
-    num_panels = num_elements // element_batch
-    wp.launch_tiled(
-        kernel,
-        dim=[num_panels],
-        inputs=[a_wp, b_wp, packed_wp, out_wp],
-        block_dim=_default_block_dim(device),
-        device=device,
-    )
-    wp.synchronize_device(device)
-    return out_wp.numpy()
+    return _contract(dofs, (a_mat, b_mat), n, q, 2, element_batch, device)
 
 
 def interpolate_3d(dofs, a_mat, b_mat, c_mat, n, q, element_batch=1, device=None):
@@ -337,33 +401,115 @@ def interpolate_3d(dofs, a_mat, b_mat, c_mat, n, q, element_batch=1, device=None
         A ``(num_elements, q^3)`` NumPy array of interpolated values at the
         quadrature points, ordered lexicographically ``(qx, qy, qz)``.
     """
-    dofs = np.ascontiguousarray(dofs)
-    num_elements = dofs.shape[0]
-    if num_elements % element_batch != 0:
-        raise ValueError(f"num_elements ({num_elements}) must be a multiple of element_batch ({element_batch}).")
+    return _contract(dofs, (a_mat, b_mat, c_mat), n, q, 3, element_batch, device)
 
-    np_dtype = dofs.dtype if dofs.dtype in (np.float32, np.float64) else np.float64
-    wp_dtype = _np_to_wp_dtype(np_dtype)
 
-    packed = pack_dofs_3d(dofs.astype(np_dtype), n)
-    a_np = np.ascontiguousarray(a_mat, dtype=np_dtype)
-    b_np = np.ascontiguousarray(b_mat, dtype=np_dtype)
-    c_np = np.ascontiguousarray(c_mat, dtype=np_dtype)
+def contract_transpose_2d(qvals, a_mat, b_mat, n, q, element_batch=1, device=None):
+    """Apply the 2D transpose contraction ``r_e = Kron(A, B)^T @ vec(g_e)`` to every element.
 
-    a_wp = wp.array(a_np, dtype=wp_dtype, device=device)
-    b_wp = wp.array(b_np, dtype=wp_dtype, device=device)
-    c_wp = wp.array(c_np, dtype=wp_dtype, device=device)
-    packed_wp = wp.array(packed, dtype=wp_dtype, device=device)
-    out_wp = wp.zeros((num_elements, q * q * q), dtype=wp_dtype, device=device)
+    This is the ``B^T`` stage of the ``B^T D B`` factorization: per-quadrature-
+    point coefficients are contracted back to element nodal residuals with the
+    transposed 1D operators, reusing the forward kernel with the input/output
+    roles swapped.
 
-    kernel = make_interpolation_kernel_3d(n, q, element_batch, wp_dtype)
-    num_panels = num_elements // element_batch
-    wp.launch_tiled(
-        kernel,
-        dim=[num_panels],
-        inputs=[a_wp, b_wp, c_wp, packed_wp, out_wp],
-        block_dim=_default_block_dim(device),
-        device=device,
-    )
-    wp.synchronize_device(device)
-    return out_wp.numpy()
+    Args:
+        qvals: ``(num_elements, q*q)`` NumPy array of per-quadrature-point
+            coefficients, ordered lexicographically ``(qx, qy)``.
+            ``num_elements`` must be a multiple of ``element_batch``.
+        a_mat: ``(q, n)`` operator matrix of the slow axis (transposed internally).
+        b_mat: ``(q, n)`` operator matrix of the fast axis (transposed internally).
+        n: Number of 1D nodes ``P + 1``.
+        q: Number of 1D quadrature points.
+        element_batch: Panel width ``E_b`` (default 1).
+        device: Warp device to run on.
+
+    Returns:
+        A ``(num_elements, n*n)`` NumPy array of nodal residuals, ordered
+        lexicographically ``(i, j)``.
+    """
+    a_t = np.ascontiguousarray(np.asarray(a_mat).T)
+    b_t = np.ascontiguousarray(np.asarray(b_mat).T)
+    return _contract(qvals, (a_t, b_t), q, n, 2, element_batch, device)
+
+
+def contract_transpose_3d(qvals, a_mat, b_mat, c_mat, n, q, element_batch=1, device=None):
+    """Apply the 3D transpose contraction ``r_e = Kron(A, B, C)^T @ vec(g_e)`` to every element.
+
+    Args:
+        qvals: ``(num_elements, q^3)`` NumPy array of per-quadrature-point
+            coefficients, ordered lexicographically ``(qx, qy, qz)``.
+            ``num_elements`` must be a multiple of ``element_batch``.
+        a_mat: ``(q, n)`` operator matrix of the slow axis (transposed internally).
+        b_mat: ``(q, n)`` operator matrix of the middle axis (transposed internally).
+        c_mat: ``(q, n)`` operator matrix of the fast axis (transposed internally).
+        n: Number of 1D nodes ``P + 1``.
+        q: Number of 1D quadrature points.
+        element_batch: Panel width ``E_b`` (default 1).
+        device: Warp device to run on.
+
+    Returns:
+        A ``(num_elements, n^3)`` NumPy array of nodal residuals, ordered
+        lexicographically ``(i, j, k)``.
+    """
+    a_t = np.ascontiguousarray(np.asarray(a_mat).T)
+    b_t = np.ascontiguousarray(np.asarray(b_mat).T)
+    c_t = np.ascontiguousarray(np.asarray(c_mat).T)
+    return _contract(qvals, (a_t, b_t, c_t), q, n, 3, element_batch, device)
+
+
+def contract_transpose_residual_2d(f0, f1_xi, f1_eta, interp, deriv, n, q, element_batch=1, device=None):
+    """Accumulate the 2D ``B^T`` residual ``r = ValueOp^T f0 + sum_axis GradOp_axis^T f1_axis``.
+
+    Convenience driver for the full ``B^T D B`` pipeline: the value coefficients
+    ``f0`` are contracted with ``Kron(I, I)^T`` and each reference-gradient
+    coefficient with the corresponding ``Kron(..., D_ref, ...)^T``, and the
+    ``1 + dim`` contributions are summed into a single residual. The
+    accumulation currently happens at the NumPy level (one kernel launch per
+    operator); a fused kernel is planned for the apply stage.
+
+    Args:
+        f0: ``(num_elements, q*q)`` value coefficients at the quadrature points.
+        f1_xi: ``(num_elements, q*q)`` ``d/dxi`` gradient coefficients.
+        f1_eta: ``(num_elements, q*q)`` ``d/deta`` gradient coefficients.
+        interp: ``(q, n)`` 1D interpolation matrix ``I``.
+        deriv: ``(q, n)`` 1D reference derivative matrix ``D_ref``.
+        n: Number of 1D nodes ``P + 1``.
+        q: Number of 1D quadrature points.
+        element_batch: Panel width ``E_b`` (default 1).
+        device: Warp device to run on.
+
+    Returns:
+        A ``(num_elements, n*n)`` NumPy array of accumulated nodal residuals.
+    """
+    residual = contract_transpose_2d(f0, interp, interp, n, q, element_batch, device)
+    residual += contract_transpose_2d(f1_xi, deriv, interp, n, q, element_batch, device)
+    residual += contract_transpose_2d(f1_eta, interp, deriv, n, q, element_batch, device)
+    return residual
+
+
+def contract_transpose_residual_3d(f0, f1_xi, f1_eta, f1_zeta, interp, deriv, n, q, element_batch=1, device=None):
+    """Accumulate the 3D ``B^T`` residual ``r = ValueOp^T f0 + sum_axis GradOp_axis^T f1_axis``.
+
+    3D counterpart of :func:`contract_transpose_residual_2d` with ``1 + dim = 4``
+    contributions.
+
+    Args:
+        f0: ``(num_elements, q^3)`` value coefficients at the quadrature points.
+        f1_xi: ``(num_elements, q^3)`` ``d/dxi`` gradient coefficients.
+        f1_eta: ``(num_elements, q^3)`` ``d/deta`` gradient coefficients.
+        f1_zeta: ``(num_elements, q^3)`` ``d/dzeta`` gradient coefficients.
+        interp: ``(q, n)`` 1D interpolation matrix ``I``.
+        deriv: ``(q, n)`` 1D reference derivative matrix ``D_ref``.
+        n: Number of 1D nodes ``P + 1``.
+        q: Number of 1D quadrature points.
+        element_batch: Panel width ``E_b`` (default 1).
+        device: Warp device to run on.
+
+    Returns:
+        A ``(num_elements, n^3)`` NumPy array of accumulated nodal residuals.
+    """
+    residual = contract_transpose_3d(f0, interp, interp, interp, n, q, element_batch, device)
+    residual += contract_transpose_3d(f1_xi, deriv, interp, interp, n, q, element_batch, device)
+    residual += contract_transpose_3d(f1_eta, interp, deriv, interp, n, q, element_batch, device)
+    residual += contract_transpose_3d(f1_zeta, interp, interp, deriv, n, q, element_batch, device)
+    return residual
