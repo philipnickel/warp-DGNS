@@ -406,6 +406,101 @@ class TrialField(AdjointField):
         return s.trial_dof
 
 
+class SeedField(AdjointField):
+    """Test-function stand-in whose value and gradient are injected seeds.
+
+    ``eval_inner`` returns a seed *value* and ``eval_grad_inner`` a seed
+    *gradient* instead of evaluating shape functions, so that the body of a
+    :func:`warp.fem.integrand` linear in the test function is reused verbatim
+    as a pointwise Q-function (the ``D`` stage of the sum-factorized
+    ``B^T D B`` pipeline, see :mod:`warp._src.fem.sumfac.qfunction`).
+
+    The seed selector is carried by the ``test_dof`` member of the
+    :class:`Sample`, decoded branchlessly with ``get_node_index_in_element``:
+    index ``0`` selects the value seed ``(v = 1, grad v = 0)`` and index
+    ``1 + i`` the gradient seed ``(v = 0, grad v = e_i)`` for spatial axis
+    ``i``. The injected gradient is expressed directly in the frame chosen by
+    the consumer (the Q-function extraction seeds *physical* unit vectors), so
+    no reference-gradient transform is applied here.
+
+    This channel was chosen over carrying seed values in the ``EvalArg``
+    because the consumer evaluates the integrand ``d + 1`` times per
+    quadrature point with different seeds: the :class:`Sample` is already a
+    per-evaluation value rebuilt in registers, whereas ``EvalArg`` data is
+    uniform per launch (or would require per-QP device arrays and the
+    associated global-memory traffic inside the fused Phase 3 kernel). It also
+    reuses the exact slot (``test_dof``) that the standard assembly kernels
+    use to select the test basis function, so the integrand transformation
+    machinery is unchanged.
+
+    Only scalar-valued spaces are supported for now; vector/tensor-valued
+    seeding would additionally need to enumerate the value degrees of freedom
+    (the ``get_node_coord`` half of the ``DofIndex``).
+
+    Args:
+        space: Scalar-valued function space of the test function being seeded.
+        space_partition: Space partition associated with the test function.
+        domain: Domain over which the seeded integrand is evaluated.
+    """
+
+    def __init__(self, space: FunctionSpace, space_partition: SpacePartition, domain: GeometryDomain):
+        if space.NODE_DOF_COUNT != 1 or space.VALUE_DOF_COUNT != 1:
+            raise NotImplementedError("SeedField is only implemented for scalar-valued function spaces")
+
+        super().__init__(space, space_partition, domain)
+
+    @classmethod
+    def from_field(cls, field: AdjointField) -> "SeedField":
+        """Build a :class:`SeedField` standing in for an existing test or trial field."""
+        return cls(field.space, field.space_partition, field.domain)
+
+    @wp.func
+    def _get_dof(s: Any):
+        return s.test_dof
+
+    def _make_eval_inner(self):
+        value_type = self.dtype
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_seed_inner(args: self.ElementEvalArg, s: self.SampleType):
+            seed_index = get_node_index_in_element(s.test_dof)
+            return wp.where(seed_index == 0, value_type(1.0), value_type(0.0))
+
+        return eval_seed_inner
+
+    def _make_eval_grad_inner(self):
+        if not self.gradient_valid():
+            return None
+
+        value_type = self.dtype
+        gradient_type = self.gradient_dtype
+        GRAD_DIM = self.geometry.dimension
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_seed_grad_inner(args: self.ElementEvalArg, s: self.SampleType):
+            seed_index = get_node_index_in_element(s.test_dof)
+            grad_seed = gradient_type()
+            for i in range(GRAD_DIM):
+                grad_seed[i] = wp.where(seed_index == i + 1, value_type(1.0), value_type(0.0))
+            return grad_seed
+
+        return eval_seed_grad_inner
+
+    def _make_eval_div_inner(self):
+        # Divergence seeding is not defined for scalar spaces
+        return None
+
+    def _make_eval_outer(self):
+        # Seeds do not distinguish inner from outer evaluation (cell domains only)
+        return self.eval_inner
+
+    def _make_eval_grad_outer(self):
+        return self.eval_grad_inner
+
+    def _make_eval_div_outer(self):
+        return None
+
+
 class LocalAdjointField(SpaceField):
     """
     A custom field specially for dispatched assembly.
