@@ -120,6 +120,7 @@ Self-contained subpackage + small reviewable hooks → contained diff against up
 | **4 · Assembly** | action-on-unit-vectors → BSR | assembled == naive assembly | CPU corr. |
 | **5 · Face fallback + bench** | face integrals fall back correctly; end-to-end DG; speedup + tensor-core roofline | example reproduced at P≥5; speedup curve | **GPU** |
 | **6 · Surface sum-fac** | face/flux terms sum-factorized: GLL endpoint traces (value = DOF slice, normal grad = endpoint ``D̂`` row), (d−1)-dim tensor-product contraction, inner+outer traces for jumps/averages | face apply == naive on side domains; DG example fully sum-factorized at P≥5 | **GPU** |
+| **7 · High-order examples** | existing `warp/examples/fem/` examples adapted to high order on the sum-fac path (DG convection-diffusion, diffusion 3D, Burgers/Kelvin–Helmholtz) | each example matches its legacy-path result at P≥5; registered in example tests; per-example speedup reported | **GPU** |
 
 Phases 0 and 1 are independent. Phase 3 is the integration gate. **GPU/tensor-core performance
 validation (Phase 5) requires a CUDA machine — not the local CPU-only Mac.**

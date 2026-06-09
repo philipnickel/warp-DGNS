@@ -466,6 +466,39 @@ updated: volume+surface speedup curve.
 
 ---
 
+## Phase 7 · High-order example adoption (GPU)
+
+**Goal:** Demonstrate the transparent pass on real workloads by adapting existing
+`warp/examples/fem/` examples to high polynomial order on the sum-factorization path. The
+physics and example structure stay as upstream wrote them — the adaptation is raising
+``degree``, switching to tensor-product discontinuous spaces where the original used low-order
+ones, and (optionally) printing the sum-fac vs. legacy timing.
+
+### Candidate examples (in priority order)
+1. `example_convection_diffusion_dg.py` → `example_convection_diffusion_dg_p5.py` (or a
+   ``--degree`` arg on the original): THE target workload — DG volume + flux terms at P≥5.
+2. `example_diffusion_3d.py`: hex stiffness operator, the canonical BᵀDB case; matrix-free CG
+   at P≥5 vs. assembled legacy solve.
+3. `example_burgers.py` or `example_kelvin_helmholtz.py`: nonlinear DG transport — exercises
+   repeated `integrate()` calls per step where apply-path speedup compounds.
+
+### Approach
+- Prefer adding a ``--degree`` / ``--sumfac {auto,force,off}`` CLI arg to the existing example
+  over forking a copy; fork only when high-order needs structural changes (e.g. coarser mesh to
+  keep DOF count comparable).
+- Each adapted example must run twice in its test: ``sumfac=force`` vs. ``sumfac=off`` on the
+  same inputs, asserting field agreement (rtol≈1e-6, matching the Phase 5 end-to-end gate).
+- Register in `warp/tests/fem/test_fem_examples.py` following the existing example-test pattern
+  (CUDA-gated where runtime demands).
+- Report per-example wall-clock speedup at P=5..8 in the PR description / bench notes (no
+  timing asserts in tests).
+
+### Acceptance gate
+Adapted examples produce fields matching their legacy-path runs at P≥5 on CUDA; example tests
+green; per-example speedups recorded alongside the Phase 5 roofline numbers.
+
+---
+
 ## Cross-cutting: full-suite regression & finalize
 
 After each phase, run the touched FEM tests plus the existing ones to catch regressions:
