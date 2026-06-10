@@ -732,7 +732,13 @@ def get_integrate_linear_sumfac_kernel(
     # loops with index arithmetic so that Warp does not unroll them (their
     # trip counts exceed the unroll limit): a fully unrolled D stage inlines
     # hundreds of seeded integrand evaluations and makes the generated source
-    # pathologically large for NVRTC at high degrees.
+    # pathologically large for NVRTC at high degrees. The wp.static() guards
+    # inside the loop bodies do not defeat this: closure booleans are
+    # evaluated and replaced by constants at declaration time
+    # (replace_static_expressions in warp/_src/codegen.py), so the loops
+    # never reach get_unroll_range's force-unroll path, which only fires for
+    # static expressions that cannot be resolved early. Verified against the
+    # generated source: the D-stage loops compile to dynamic loops.
     n_c = wp.constant(n)
     q_c = wp.constant(q)
     nn_c = wp.constant(n * n)
