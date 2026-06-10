@@ -105,6 +105,10 @@ _SUPPORTED_INPUT_OPERATORS = frozenset(
     )
 )
 
+# Operators that require seeding (and contracting) the gradient channels of a
+# test or trial field.
+_GRAD_OPERATORS = frozenset((fem_operator.grad, fem_operator.grad_outer))
+
 
 def sumfac_block_dim(device) -> int:
     """Pick the tile-kernel block size for ``device``.
@@ -116,11 +120,9 @@ def sumfac_block_dim(device) -> int:
 
 
 @dataclass
-class SumfacLayout:
-    """Host-side description of a qualifying tensor-product form."""
+class _SumfacLayoutBase:
+    """Host-side description shared by the linear and bilinear layouts."""
 
-    input_name: str
-    input_field: NodalField
     degree: int
     n: int
     q: int
@@ -130,21 +132,19 @@ class SumfacLayout:
 
 
 @dataclass
-class SumfacPlan:
-    """Launch-side description of a sum-factorized linear-form integration.
+class SumfacLayout(_SumfacLayoutBase):
+    """Host-side description of a qualifying tensor-product linear form."""
 
-    Built by :func:`make_sumfac_plan` once a form has qualified; carries the
-    original input field (for the in-kernel DOF gather), the substituted
-    :class:`SeedField`/:class:`ValueInjectedField` instances, the baked tile
-    sizes, and the host 1D operator matrices.
-    """
+    input_name: str
+    input_field: NodalField
+
+
+@dataclass
+class _SumfacPlanBase:
+    """Launch-side fields shared by the linear and bilinear plans."""
 
     test: TestField
     test_name: str
-    input_name: str
-    input_field: NodalField
-    seed_field: SeedField
-    injected_field: ValueInjectedField
     degree: int
     n: int
     q: int
@@ -162,6 +162,22 @@ class SumfacPlan:
     def operator_arrays(self, dtype, device) -> tuple[wp.array, wp.array]:
         """Return the ``(interp, deriv)`` device arrays in ``dtype`` on ``device``, cached."""
         return _get_operator_arrays(self.interp, self.deriv, dtype, device)
+
+
+@dataclass
+class SumfacPlan(_SumfacPlanBase):
+    """Launch-side description of a sum-factorized linear-form integration.
+
+    Built by :func:`make_sumfac_plan` once a form has qualified; carries the
+    original input field (for the in-kernel DOF gather), the substituted
+    :class:`SeedField`/:class:`ValueInjectedField` instances, the baked tile
+    sizes, and the host 1D operator matrices.
+    """
+
+    input_name: str
+    input_field: NodalField
+    seed_field: SeedField
+    injected_field: ValueInjectedField
 
 
 _operator_array_cache: dict[Any, tuple[wp.array, wp.array]] = {}
@@ -240,16 +256,18 @@ def _is_tensor_product_scalar_dg_space(space: FunctionSpace, dim: int) -> bool:
 
 
 def _find_tensor_product_core(
+    integrand,
+    arguments,
     test: TestField,
     quadrature: Quadrature,
     domain: GeometryDomain,
-) -> tuple[int, np.ndarray] | None:
-    """Verify the geometric/space/quadrature assumptions shared by the apply and assembly paths.
+) -> tuple[int, np.ndarray, set] | None:
+    """Verify the geometric/space/quadrature/operator assumptions shared by the apply and assembly paths.
 
-    Returns ``(dim, qpoints_1d)`` for a cell domain over a tensor-product
-    geometry with a scalar discontinuous tensor-product test space and a
-    matching lexicographic tensor-product :class:`RegularQuadrature`, else
-    ``None``.
+    Returns ``(dim, qpoints_1d, test_operators)`` for a cell domain over a
+    tensor-product geometry with a scalar discontinuous tensor-product test
+    space, a matching lexicographic tensor-product :class:`RegularQuadrature`,
+    and only seedable operators on the test field, else ``None``.
     """
     if domain.element_kind != ElementKind.CELL:
         return None
@@ -267,7 +285,13 @@ def _find_tensor_product_core(
     if qpoints_1d is None:
         return None
 
-    return dim, qpoints_1d
+    if integrand.operators is None:
+        return None
+    test_operators = integrand.operators.get(arguments.test_name, set())
+    if not test_operators <= _SUPPORTED_TEST_OPERATORS:
+        return None
+
+    return dim, qpoints_1d, test_operators
 
 
 def find_sumfac_layout(
@@ -291,17 +315,11 @@ def find_sumfac_layout(
         quadrature: Quadrature formula of the integration.
         domain: Integration domain.
     """
-    core = _find_tensor_product_core(test, quadrature, domain)
+    core = _find_tensor_product_core(integrand, arguments, test, quadrature, domain)
     if core is None:
         return None
-    dim, qpoints_1d = core
+    dim, qpoints_1d, test_operators = core
     space = test.space
-
-    if integrand.operators is None:
-        return None
-    test_operators = integrand.operators.get(arguments.test_name, set())
-    if not test_operators <= _SUPPORTED_TEST_OPERATORS:
-        return None
 
     # Exactly one injectable input field: a nodal field over the same space as
     # the test field, accessed only through value/gradient operators. Other
@@ -335,8 +353,17 @@ def find_sumfac_layout(
         # integrand actually applies a gradient operator to the test field;
         # this matches the legacy dispatch path, which restricts the Taylor
         # DOFs to the operators in use (LocalAdjointField.notify_operator_usage).
-        test_uses_grad=bool({fem_operator.grad, fem_operator.grad_outer} & test_operators),
+        test_uses_grad=bool(_GRAD_OPERATORS & test_operators),
     )
+
+
+def _build_1d_operator_matrices(test: TestField, layout: _SumfacLayoutBase) -> tuple[np.ndarray, np.ndarray]:
+    """Build the ``(q, n)`` 1D interpolation/derivative matrices for the test space's basis nodes."""
+    shape = test.space.basis.shape
+    nodes_1d = np.asarray(quadrature_1d(point_count=layout.n, family=shape.family)[0], dtype=np.float64)
+    interp = build_interpolation_matrix(nodes_1d, layout.qpoints_1d)
+    deriv = build_derivative_matrix(nodes_1d, layout.qpoints_1d)
+    return interp, deriv
 
 
 def make_sumfac_plan(
@@ -359,10 +386,7 @@ def make_sumfac_plan(
     if layout is None:
         return None
 
-    shape = test.space.basis.shape
-    nodes_1d = np.asarray(quadrature_1d(point_count=layout.n, family=shape.family)[0], dtype=np.float64)
-    interp = build_interpolation_matrix(nodes_1d, layout.qpoints_1d)
-    deriv = build_derivative_matrix(nodes_1d, layout.qpoints_1d)
+    interp, deriv = _build_1d_operator_matrices(test, layout)
 
     seed_field = SeedField.from_field(test)
     injected_field = ValueInjectedField.from_field(layout.input_field, domain)
@@ -432,20 +456,14 @@ def _sumfac_bilinear_smem_estimate(n: int, q: int, dim: int, scalar_bytes: int) 
 
 
 @dataclass
-class SumfacBilinearLayout:
+class SumfacBilinearLayout(_SumfacLayoutBase):
     """Host-side description of a qualifying tensor-product bilinear form."""
 
-    degree: int
-    n: int
-    q: int
-    dim: int
-    qpoints_1d: np.ndarray
-    test_uses_grad: bool
     trial_uses_grad: bool
 
 
 @dataclass
-class SumfacBilinearPlan:
+class SumfacBilinearPlan(_SumfacPlanBase):
     """Launch-side description of a sum-factorized bilinear-form assembly.
 
     Built by :func:`make_sumfac_bilinear_plan` once a form has qualified;
@@ -453,30 +471,11 @@ class SumfacBilinearPlan:
     instances, the baked tile sizes, and the host 1D operator matrices.
     """
 
-    test: TestField
     trial: TrialField
-    test_name: str
     trial_name: str
     test_seed: SeedField
     trial_seed: TrialSeedField
-    degree: int
-    n: int
-    q: int
-    dim: int
-    element_batch: int
-    interp: np.ndarray
-    deriv: np.ndarray
-    test_uses_grad: bool
     trial_uses_grad: bool
-
-    @property
-    def nodes_per_element(self) -> int:
-        """Number of nodes per element, ``n**dim``."""
-        return self.n**self.dim
-
-    def operator_arrays(self, dtype, device) -> tuple[wp.array, wp.array]:
-        """Return the ``(interp, deriv)`` device arrays in ``dtype`` on ``device``, cached."""
-        return _get_operator_arrays(self.interp, self.deriv, dtype, device)
 
 
 def find_sumfac_bilinear_layout(
@@ -506,24 +505,17 @@ def find_sumfac_bilinear_layout(
         quadrature: Quadrature formula of the integration.
         domain: Integration domain.
     """
-    core = _find_tensor_product_core(test, quadrature, domain)
+    core = _find_tensor_product_core(integrand, arguments, test, quadrature, domain)
     if core is None:
         return None
-    dim, qpoints_1d = core
+    dim, qpoints_1d, test_operators = core
     space = test.space
 
     # Same scalar space on both sides; the column node indexing and the
     # shared 1D operators both assume it.
     if trial.space.name != space.name:
         return None
-    if trial.space.NODE_DOF_COUNT != 1 or trial.space.VALUE_DOF_COUNT != 1:
-        return None
 
-    if integrand.operators is None:
-        return None
-    test_operators = integrand.operators.get(arguments.test_name, set())
-    if not test_operators <= _SUPPORTED_TEST_OPERATORS:
-        return None
     trial_operators = integrand.operators.get(arguments.trial_name, set())
     if not trial_operators <= _SUPPORTED_TEST_OPERATORS:
         return None
@@ -535,15 +527,14 @@ def find_sumfac_bilinear_layout(
     if _sumfac_bilinear_smem_estimate(n, q, dim, scalar_bytes) > SUMFAC_BILINEAR_SMEM_BUDGET:
         return None
 
-    grad_operators = {fem_operator.grad, fem_operator.grad_outer}
     return SumfacBilinearLayout(
         degree=degree,
         n=n,
         q=q,
         dim=dim,
         qpoints_1d=qpoints_1d,
-        test_uses_grad=bool(grad_operators & test_operators),
-        trial_uses_grad=bool(grad_operators & trial_operators),
+        test_uses_grad=bool(_GRAD_OPERATORS & test_operators),
+        trial_uses_grad=bool(_GRAD_OPERATORS & trial_operators),
     )
 
 
@@ -569,10 +560,7 @@ def make_sumfac_bilinear_plan(
     if layout is None:
         return None
 
-    shape = test.space.basis.shape
-    nodes_1d = np.asarray(quadrature_1d(point_count=layout.n, family=shape.family)[0], dtype=np.float64)
-    interp = build_interpolation_matrix(nodes_1d, layout.qpoints_1d)
-    deriv = build_derivative_matrix(nodes_1d, layout.qpoints_1d)
+    interp, deriv = _build_1d_operator_matrices(test, layout)
 
     test_seed = SeedField.from_field(test)
     trial_seed = TrialSeedField.from_field(trial)
