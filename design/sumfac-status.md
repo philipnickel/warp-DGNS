@@ -77,6 +77,13 @@
   `NVCC_PREPEND_FLAGS="-ccbin /usr/bin/g++" WARP_CUDA_PATH=/root/cuda-env/.pixi/envs/default uv run build_lib.py --quick`
   (the env's conda gcc 14.3 breaks nvcc 13.0's frontend; the system g++ works).
 - Never run `-m warp.tests` during iteration (clears kernel cache). Run test files directly. All sumfac tests warm-run in seconds.
+- NCU (nsight-compute 2025.3.1, `/root/cuda-env/.pixi/envs/default/bin/ncu`) works on this box incl. GPU perf
+  counters. First SIPG matvec profile (Grid2D 128x128 P=4 f64, 409,600 DOFs, hybrid = sumfac volume apply +
+  assembled SIP side matrix, script pattern in git history / `/tmp/sipg_matvec_profile.py`): volume sumfac apply
+  0.62 ms (NCU: SM compute 83%, DRAM 0.2% -- compute-bound, intermediates fully on-chip), side `bsr_mv` 0.44 ms
+  (DRAM 40%, SM 12% -- bandwidth-bound), full matvec 1.04 ms. Quantifies the Phase 6 payoff: ~40% of the hybrid
+  operator is the memory-bound non-sumfac side path. Note sm_120 has no FP64 tensor cores; DMMA utilization is
+  an A100 metric. No nsys in the pixi env (`pixi add nsight-systems` if a timeline is needed).
 - `test_gimp_quadrature` / `test_cube_shape_functions` CheckOutput failures on CUDA + `test_volume` NVDB import error are pre-existing environmental noise (confirmed against pristine main).
 - Codex CLI works for implementation tasks with: `codex exec --skip-git-repo-check -m gpt-5.5 --config model_reasoning_effort="high" --sandbox danger-full-access -c approval_policy="never" -C /root/warp-DGNS "<prompt>" </dev/null` (bubblewrap sandboxing is non-functional in this container; `--full-auto` silently overrides the sandbox mode — do not pass it).
 - Orchestration pattern that worked: spec → implement (Codex or workflow agent) → direct-run test gates on cpu+cuda → adversarial review with refutation lenses → fix round → signed commit → push.
