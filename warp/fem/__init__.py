@@ -104,6 +104,7 @@ from warp._src.fem.operator import grad as grad
 from warp._src.fem.operator import grad_average as grad_average
 from warp._src.fem.operator import grad_jump as grad_jump
 from warp._src.fem.operator import grad_outer as grad_outer
+from warp._src.fem.integrate import get_sumfac_mode as get_sumfac_mode
 from warp._src.fem.operator import inner as inner
 from warp._src.fem.operator import integrand as integrand
 from warp._src.fem.integrate import integrate as integrate
@@ -145,6 +146,7 @@ from warp._src.fem.dirichlet import project_system_rhs as project_system_rhs
 from warp._src.fem.types import Sample as Sample
 from warp._src.fem.types import Sample_f64 as Sample_f64
 from warp._src.fem.cache import set_default_temporary_store as set_default_temporary_store
+from warp._src.fem.integrate import set_sumfac_mode as set_sumfac_mode
 from warp._src.fem.operator import to_cell_side as to_cell_side
 from warp._src.fem.operator import to_inner_cell as to_inner_cell
 from warp._src.fem.operator import to_outer_cell as to_outer_cell

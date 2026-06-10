@@ -9,6 +9,9 @@ the Q-function extraction machinery. See ``design/`` and the design spec for the
 overall ``B^T D B`` factorization.
 """
 
+from warp._src.fem.sumfac.kernels import (
+    make_sumfac_linear_operator,
+)
 from warp._src.fem.sumfac.operators_1d import (
     build_derivative_matrix,
     build_interpolation_matrix,
@@ -40,6 +43,7 @@ __all__ = [
     "interpolate_3d",
     "make_interpolation_kernel_2d",
     "make_interpolation_kernel_3d",
+    "make_sumfac_linear_operator",
     "pack_dofs_2d",
     "pack_dofs_3d",
     "reference_geometry_factors",

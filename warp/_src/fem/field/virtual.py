@@ -501,6 +501,94 @@ class SeedField(AdjointField):
         return None
 
 
+class ValueInjectedField(AdjointField):
+    """Field stand-in whose value and gradient are injected per evaluation.
+
+    ``eval_inner`` returns the ``value`` member of the :class:`EvalArg` and
+    ``eval_grad_inner`` its ``gradient`` member, instead of evaluating shape
+    functions against degrees of freedom. This is the input-field sibling of
+    :class:`SeedField` used by the fused sum-factorized ``B^T D B`` kernel
+    (see :mod:`warp._src.fem.sumfac.kernels`): the kernel's ``B`` stage
+    interpolates the input field's element DOFs to the quadrature points with
+    tile contractions, then fills a fresh ``EvalArg`` per quadrature point
+    with the interpolated value and physical gradient before invoking the
+    transformed integrand, so the user's integrand body is reused verbatim
+    without re-evaluating the input basis per quadrature point.
+
+    Unlike :class:`SeedField`, whose one-hot seeds travel through the
+    ``Sample``, the injected data are arbitrary values, so they are carried by
+    the ``EvalArg`` struct; the consumer builds a fresh local ``EvalArg`` per
+    quadrature point (kernel-parameter structs are effectively immutable).
+    ``fill_eval_arg`` is therefore a host-side no-op.
+
+    Only scalar-valued spaces are supported for now, mirroring
+    :class:`SeedField`.
+
+    Args:
+        space: Scalar-valued function space of the field being stood in for.
+        space_partition: Space partition associated with the original field.
+        domain: Domain over which the integrand is evaluated.
+    """
+
+    def __init__(self, space: FunctionSpace, space_partition: SpacePartition, domain: GeometryDomain):
+        if space.NODE_DOF_COUNT != 1 or space.VALUE_DOF_COUNT != 1:
+            raise NotImplementedError("ValueInjectedField is only implemented for scalar-valued function spaces")
+
+        super().__init__(space, space_partition, domain)
+
+    @classmethod
+    def from_field(cls, field: SpaceField, domain: GeometryDomain) -> "ValueInjectedField":
+        """Build a :class:`ValueInjectedField` standing in for an existing discrete field."""
+        return cls(field.space, field.space_partition, domain)
+
+    @wp.func
+    def _get_dof(s: Any):
+        return s.trial_dof
+
+    def _make_eval_arg(self):
+        @cache.dynamic_struct(suffix=self.name)
+        class EvalArg:
+            value: self.dtype
+            gradient: self.gradient_dtype
+
+        return EvalArg
+
+    def fill_eval_arg(self, arg, device):
+        # The value and gradient members are written in-kernel; nothing to fill host-side.
+        pass
+
+    def _make_eval_inner(self):
+        @cache.dynamic_func(suffix=self.name)
+        def eval_value_inner(args: self.ElementEvalArg, s: self.SampleType):
+            return args.eval_arg.value
+
+        return eval_value_inner
+
+    def _make_eval_grad_inner(self):
+        if not self.gradient_valid():
+            return None
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_grad_inner(args: self.ElementEvalArg, s: self.SampleType):
+            return args.eval_arg.gradient
+
+        return eval_grad_inner
+
+    def _make_eval_div_inner(self):
+        # Divergence injection is not defined for scalar spaces
+        return None
+
+    def _make_eval_outer(self):
+        # Injected values do not distinguish inner from outer evaluation (cell domains only)
+        return self.eval_inner
+
+    def _make_eval_grad_outer(self):
+        return self.eval_grad_inner
+
+    def _make_eval_div_outer(self):
+        return None
+
+
 class LocalAdjointField(SpaceField):
     """
     A custom field specially for dispatched assembly.

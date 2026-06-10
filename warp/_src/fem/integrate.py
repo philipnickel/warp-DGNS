@@ -3,6 +3,7 @@
 
 import ast
 import inspect
+import os
 import textwrap
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -53,7 +54,7 @@ from warp._src.types import is_array, type_length, type_repr, type_scalar_type, 
 from warp._src.utils import array_cast, array_scan
 from warp.sparse import BsrMatrix, bsr_axpy, bsr_compress, bsr_set_from_triplets, bsr_set_zero, bsr_zeros
 
-__all__ = ["integrate", "interpolate"]
+__all__ = ["get_sumfac_mode", "integrate", "interpolate", "set_sumfac_mode"]
 
 _wp_module_name_ = "warp.fem.integrate"
 
@@ -107,6 +108,119 @@ def _require_bsr_capacity(bsr: BsrMatrix, nnz: int, operation: str):
             f"{operation} with bsr_options['capacity']='reuse' requires existing BSR storage for at least "
             f"{nnz} blocks, got columns={bsr.columns.size} and values={bsr.values.size}"
         )
+
+
+_SUMFAC_MODES = ("auto", "force", "off")
+
+#: Minimum polynomial degree for which the sum-factorized path is selected in
+#: "auto" mode; below it the legacy kernels are typically faster. Module-level
+#: so it can be overridden for experiments.
+SUMFAC_DEGREE_THRESHOLD = 4
+
+
+def _initial_sumfac_mode() -> str:
+    mode = os.environ.get("WARP_FEM_SUMFAC", "auto").strip().lower()
+    return mode if mode in _SUMFAC_MODES else "auto"
+
+
+_sumfac_mode: str = _initial_sumfac_mode()
+
+
+def set_sumfac_mode(mode: str):
+    """Set the sum-factorization dispatch mode for :func:`integrate`.
+
+    Args:
+        mode: One of ``"auto"`` (select the sum-factorized kernels whenever
+            the form structurally qualifies and the polynomial degree is at
+            least ``SUMFAC_DEGREE_THRESHOLD``), ``"force"`` (select them
+            whenever structurally possible, bypassing the degree threshold),
+            or ``"off"`` (always use the legacy kernels).
+
+    The initial mode may also be set through the ``WARP_FEM_SUMFAC``
+    environment variable.
+    """
+    global _sumfac_mode
+    if mode not in _SUMFAC_MODES:
+        raise ValueError(f"Invalid sum-factorization mode '{mode}', expected one of {_SUMFAC_MODES}")
+    _sumfac_mode = mode
+
+
+def get_sumfac_mode() -> str:
+    """Return the current sum-factorization dispatch mode (see :func:`set_sumfac_mode`)."""
+    return _sumfac_mode
+
+
+def sumfac_applicable(
+    integrand: "Integrand",
+    arguments: "IntegrandArguments",
+    test: "TestField | None",
+    trial: "TrialField | None",
+    quadrature: Quadrature | None,
+    domain: GeometryDomain | None,
+    mode: str | None = None,
+) -> bool:
+    """Conservative predicate deciding whether the sum-factorized path may be used.
+
+    Internal: operates on the parsed integrand arguments produced by
+    :func:`integrate` and requires ``integrand.operators`` to be populated.
+
+    Requires a linear form (test field, no trial) over a cell domain with a
+    tensor-product geometry and a scalar, discontinuous, tensor-product
+    polynomial test space, integrated with a matching tensor-product
+    :class:`RegularQuadrature`, accessing the test field only through value
+    and gradient operators, with a single injectable input field. In
+    ``"auto"`` mode the space degree must also reach
+    ``SUMFAC_DEGREE_THRESHOLD``. Anything unproven returns ``False``: the
+    caller falls through to the legacy kernels, which is always correct.
+
+    Args:
+        integrand: The form being integrated.
+        arguments: Parsed integrand arguments (before field substitution).
+        test: Test field of the form, if any.
+        trial: Trial field of the form, if any.
+        quadrature: Quadrature formula of the integration.
+        domain: Integration domain.
+        mode: Sum-factorization mode to evaluate against; defaults to the
+            current global mode (see :func:`set_sumfac_mode`).
+    """
+    if mode is None:
+        mode = get_sumfac_mode()
+    if mode == "off":
+        return False
+    if test is None or trial is not None:
+        return False
+    # Plain test field only (excludes LocalTestField dispatched assembly views)
+    if type(test) is not TestField:
+        return False
+    if quadrature is None or domain is None or quadrature.domain != domain:
+        return False
+    if not isinstance(quadrature, RegularQuadrature):
+        return False
+    if mode != "force" and test.space.degree < SUMFAC_DEGREE_THRESHOLD:
+        return False
+
+    _find_integrand_operators(integrand, arguments.field_args)
+
+    from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+
+    return sumfac_kernels.find_sumfac_layout(integrand, arguments, test, quadrature, domain) is not None
+
+
+def _any_field_requires_grad(field_args: dict[str, Any]) -> bool:
+    """Return whether any field argument carries differentiable degrees of freedom.
+
+    Conservative: a field whose degrees of freedom cannot be introspected is
+    treated as differentiable (the caller falls back to the legacy kernels,
+    which support autodiff).
+    """
+    for field in field_args.values():
+        try:
+            dof_values = getattr(field, "dof_values", None)
+        except NotImplementedError:
+            return True
+        if is_array(dof_values) and dof_values.requires_grad:
+            return True
+    return False
 
 
 def _resolve_path(func, node):
@@ -1171,10 +1285,107 @@ def _generate_integrate_kernel(
     output_dtype: type,
     accumulate_dtype: type,
     kernel_options: dict[str, Any] | None = None,
+    sumfac_plan=None,
 ) -> wp.Kernel:
     output_dtype = type_scalar_type(output_dtype)
 
     _notify_operator_usage(integrand, arguments.field_args)
+
+    if sumfac_plan is not None:
+        # Sum-factorized fused B^T D B kernel. Must be handled before the generic
+        # branches: the SeedField/ValueInjectedField substitution (performed by
+        # make_sumfac_plan) changes the field structs and the transformed
+        # integrand, so the kernel suffix is recomputed from the substituted
+        # field names and tagged with a sum-factorization discriminator plus the
+        # baked tile sizes -- a cache-key collision with the legacy kernel would
+        # be a silent-correctness bug.
+        from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+
+        field_names = tuple((k, f.name) for k, f in arguments.field_args.items())
+        kernel_suffix = (
+            "sumfac",
+            sumfac_plan.element_batch,
+            sumfac_plan.n,
+            sumfac_plan.q,
+            sumfac_plan.dim,
+            sumfac_plan.test_uses_grad,
+            # The kernel bakes the ORIGINAL input field's _read_node_value and
+            # EvalArg, but the substituted field names only carry the
+            # ValueInjectedField name: discriminate on the concrete class so a
+            # future NodalField subclass over the same space cannot silently
+            # reuse the base-class kernel.
+            type(sumfac_plan.input_field).__qualname__,
+            quadrature.name,
+            field_names,
+            cache.pod_type_key(output_dtype),
+            cache.pod_type_key(accumulate_dtype),
+        )
+        # The staged kernel does not support autodiff yet; with backward enabled
+        # every tile_matmul would build three GEMM LTOs, tripling compile time.
+        sumfac_kernel_options = dict(kernel_options) if kernel_options else {}
+        sumfac_kernel_options["enable_backward"] = False
+
+        kernel, field_arg_values, value_struct_values = cache.get_integrand_kernel(
+            integrand=integrand,
+            suffix=kernel_suffix,
+            kernel_options=sumfac_kernel_options,
+        )
+        if kernel is None:
+            FieldStruct = _gen_field_struct(arguments.field_args)
+            ValueStruct = cache.get_argument_struct(arguments.value_args)
+
+            _check_field_compat(integrand, arguments, domain)
+
+            integrand_func = IntegrandTransformer.apply(
+                integrand, arguments.field_args, sample_type=domain.geometry.sample_type
+            )
+
+            integrate_kernel_fn = sumfac_kernels.get_integrate_linear_sumfac_kernel(
+                integrand_func,
+                domain,
+                quadrature,
+                FieldStruct,
+                ValueStruct,
+                test=test,
+                input_field=sumfac_plan.input_field,
+                injected_field=sumfac_plan.injected_field,
+                n=sumfac_plan.n,
+                q=sumfac_plan.q,
+                dim=sumfac_plan.dim,
+                element_batch=sumfac_plan.element_batch,
+                test_uses_grad=sumfac_plan.test_uses_grad,
+                accumulate_dtype=accumulate_dtype,
+            )
+
+            copied_field_names = [
+                name
+                for name, field in arguments.field_args.items()
+                if isinstance(field, FieldLike) and name != sumfac_plan.input_name
+            ]
+            kernel, _FieldStruct, _ValueStruct = cache.get_integrand_kernel(
+                integrand=integrand,
+                kernel_fn=integrate_kernel_fn,
+                suffix=kernel_suffix,
+                kernel_options=sumfac_kernel_options,
+                code_transformers=[
+                    sumfac_kernels.SumfacQPFieldsTransformer(
+                        copied_field_names=copied_field_names,
+                        injected_field_name=sumfac_plan.input_name,
+                    ),
+                    PassFieldArgsToIntegrand(
+                        arg_names=integrand.argspec.args,
+                        parsed_args=arguments,
+                        integrand_func=integrand_func,
+                        fields_var_name="qp_fields",
+                    ),
+                ],
+                FieldStruct=FieldStruct,
+                ValueStruct=ValueStruct,
+            )
+            field_arg_values, value_struct_values = FieldStruct(), ValueStruct()
+
+        kernel._wp_fem_sumfac_ = True
+        return kernel, field_arg_values, value_struct_values
 
     # Check if kernel exist in cache
     field_names = tuple((k, f.name) for k, f in arguments.field_args.items())
@@ -1422,6 +1633,7 @@ def _launch_integrate_kernel(
     add_to_output: bool,
     bsr_options: dict[str, Any] | None,
     device,
+    sumfac_plan=None,
 ):
     # Set-up launch arguments
     domain_elt_arg = domain.element_arg_value(device=device)
@@ -1542,7 +1754,64 @@ def _launch_integrate_kernel(
             )
         )
 
-        if nodal:
+        if sumfac_plan is not None:
+            from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+
+            element_count = domain.element_count()
+            nodes_per_element = sumfac_plan.nodes_per_element
+
+            interp_arr, deriv_arr = sumfac_plan.operator_arrays(accumulate_dtype, device)
+            input_eval_arg = sumfac_plan.input_field.EvalArg()
+            sumfac_plan.input_field.fill_eval_arg(input_eval_arg, device)
+
+            staging = cache.borrow_temporary(
+                temporary_store,
+                shape=(element_count, nodes_per_element),
+                dtype=accumulate_dtype,
+                device=device,
+            )
+
+            wp.launch_tiled(
+                kernel,
+                dim=[element_count],
+                inputs=[
+                    qp_arg,
+                    domain_elt_arg,
+                    domain_elt_index_arg,
+                    field_arg_values,
+                    value_struct_values,
+                    input_eval_arg,
+                    interp_arr,
+                    deriv_arr,
+                    staging,
+                ],
+                block_dim=sumfac_kernels.sumfac_block_dim(device),
+                device=device,
+            )
+
+            scatter_kernel = sumfac_kernels.get_sumfac_scatter_kernel(
+                domain,
+                test.space,
+                test.space_partition,
+                staging_dtype=accumulate_dtype,
+                output_dtype=type_scalar_type(output_dtype),
+            )
+            wp.launch(
+                scatter_kernel,
+                dim=(element_count, nodes_per_element),
+                inputs=[
+                    domain_elt_arg,
+                    domain_elt_index_arg,
+                    test.space.topology.topo_arg_value(device),
+                    test.space_partition.partition_arg_value(device),
+                    staging,
+                    output_view,
+                ],
+                device=device,
+            )
+
+            staging.release()
+        elif nodal:
             wp.launch(
                 kernel=kernel,
                 dim=(test.space_restriction.node_count(), test.node_dof_count),
@@ -1909,6 +2178,7 @@ def integrate(
     assembly: str | None = None,
     add: bool = False,
     bsr_options: dict[str, Any] | None = None,
+    _sumfac_mode: str | None = None,
 ):
     """
     Integrates a constant, linear or bilinear form, and returns a scalar, array, or sparse matrix, respectively.
@@ -1993,7 +2263,37 @@ def integrate(
     assembly = _pick_assembly_strategy(assembly, arguments=arguments, operators=integrand.operators)
     # print("assembly for ", integrand.name, ":", strategy)
 
-    if assembly == "dispatch":
+    sumfac_plan = None
+    if assembly != "nodal":
+        if quadrature is None:
+            order = sum(field.degree for field in fields.values())
+            quadrature = RegularQuadrature(domain=domain, order=order)
+        elif domain != quadrature.domain:
+            raise ValueError("Incompatible integration and quadrature domain")
+
+        # Transparent sum-factorization dispatch: when the form qualifies, keep
+        # the plain test field (no LocalTestField wrapping) and substitute the
+        # seed/injected fields so the fused B^T D B kernel can be generated.
+        # Only the "dispatch" strategy may be replaced: its seeded extraction
+        # semantics match the sum-factorized kernel, whereas "generic" is the
+        # documented escape hatch making no assumption about the integrand's
+        # content (e.g. forms that are not linear in the test function), so an
+        # explicit assembly="generic" request must be honored verbatim.
+        # The staged kernel has no autodiff support yet, so gradient requests
+        # fall through to the legacy kernels.
+        if (
+            assembly == "dispatch"
+            and (output is None or not getattr(output, "requires_grad", False))
+            and not (kernel_options or {}).get("enable_backward", False)
+            and type_to_warp(accumulate_dtype) in (wp.float32, wp.float64)
+            and sumfac_applicable(integrand, arguments, test, trial, quadrature, domain, mode=_sumfac_mode)
+            and not _any_field_requires_grad(arguments.field_args)
+        ):
+            from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+
+            sumfac_plan = sumfac_kernels.make_sumfac_plan(integrand, arguments, test, quadrature, domain)
+
+    if assembly == "dispatch" and sumfac_plan is None:
         if test is not None:
             test = LocalTestField(test)
             arguments.field_args[arguments.test_name] = test
@@ -2012,12 +2312,6 @@ def integrate(
             raise ValueError(
                 "Bilinear nodal integration requires test and trial to be defined on the same function space"
             )
-    else:
-        if quadrature is None:
-            order = sum(field.degree for field in fields.values())
-            quadrature = RegularQuadrature(domain=domain, order=order)
-        elif domain != quadrature.domain:
-            raise ValueError("Incompatible integration and quadrature domain")
 
     # Canonicalize types
     accumulate_dtype = type_to_warp(accumulate_dtype)
@@ -2041,6 +2335,7 @@ def integrate(
         accumulate_dtype=accumulate_dtype,
         output_dtype=output_dtype,
         kernel_options=kernel_options,
+        sumfac_plan=sumfac_plan,
     )
 
     auxiliary_kernels = _generate_auxiliary_kernels(
@@ -2071,6 +2366,7 @@ def integrate(
         add_to_output=add,
         bsr_options=bsr_options,
         device=device,
+        sumfac_plan=sumfac_plan,
     )
 
 

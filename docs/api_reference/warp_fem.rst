@@ -115,6 +115,7 @@ API
    element_index
    element_partition_index
    environment_index
+   get_sumfac_mode
    grad
    grad_average
    grad_jump
@@ -158,6 +159,7 @@ API
    project_system_rhs
    scalar_type
    set_default_temporary_store
+   set_sumfac_mode
    to_cell_side
    to_inner_cell
    to_outer_cell
