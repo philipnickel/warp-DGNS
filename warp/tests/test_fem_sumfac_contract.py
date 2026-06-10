@@ -45,8 +45,6 @@ from warp._src.fem.sumfac.tensor_contract import (
     build_operator_arrays,
     contract_transpose_2d,
     contract_transpose_3d,
-    contract_transpose_residual_2d,
-    contract_transpose_residual_3d,
     interpolate_2d,
     interpolate_3d,
     pack_dofs_2d,
@@ -72,6 +70,28 @@ def _dense_kron_2d(left, right):
 def _dense_kron_3d(a, b, c):
     """Dense 3D operator ``Kron(a, b, c)`` acting on row-major ``vec(U)``."""
     return np.kron(np.kron(a, b), c)
+
+
+def contract_transpose_residual_2d(f0, f1_xi, f1_eta, interp, deriv, n, q, element_batch=1, device=None):
+    """Accumulate the 2D ``B^T`` residual ``r = ValueOp^T f0 + sum_axis GradOp_axis^T f1_axis``.
+
+    Test-local composition of :func:`contract_transpose_2d` (one launch per
+    operator, summed at the NumPy level); the production apply path fuses this
+    into a single kernel in :mod:`warp._src.fem.sumfac.kernels`.
+    """
+    residual = contract_transpose_2d(f0, interp, interp, n, q, element_batch, device)
+    residual += contract_transpose_2d(f1_xi, deriv, interp, n, q, element_batch, device)
+    residual += contract_transpose_2d(f1_eta, interp, deriv, n, q, element_batch, device)
+    return residual
+
+
+def contract_transpose_residual_3d(f0, f1_xi, f1_eta, f1_zeta, interp, deriv, n, q, element_batch=1, device=None):
+    """3D counterpart of :func:`contract_transpose_residual_2d` (``1 + dim = 4`` contributions)."""
+    residual = contract_transpose_3d(f0, interp, interp, interp, n, q, element_batch, device)
+    residual += contract_transpose_3d(f1_xi, deriv, interp, interp, n, q, element_batch, device)
+    residual += contract_transpose_3d(f1_eta, interp, deriv, interp, n, q, element_batch, device)
+    residual += contract_transpose_3d(f1_zeta, interp, interp, deriv, n, q, element_batch, device)
+    return residual
 
 
 def test_interpolate_2d_value(test, device):

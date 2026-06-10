@@ -54,8 +54,6 @@ One kernel code path therefore serves both directions, and with the default
 
 from __future__ import annotations
 
-from functools import cache
-
 import numpy as np
 
 import warp as wp
@@ -67,17 +65,10 @@ from warp._src.fem.sumfac.operators_1d import (
     default_quadrature_points,
 )
 
-# The contraction kernels do not need autodiff yet (design risk 9.7 defers AD); with backward
-# enabled every tile_matmul builds three GEMM LTOs (forward + two adjoints), tripling the
-# first-run CUDA compile time of every kernel shape. Re-enable when the AD path lands.
-wp.set_module_options({"enable_backward": False})
-
 __all__ = [
     "build_operator_arrays",
     "contract_transpose_2d",
     "contract_transpose_3d",
-    "contract_transpose_residual_2d",
-    "contract_transpose_residual_3d",
     "interpolate_2d",
     "interpolate_3d",
     "make_interpolation_kernel_2d",
@@ -144,17 +135,22 @@ def pack_dofs_3d(dofs: np.ndarray, n: int) -> np.ndarray:
 #
 # ``P``, ``n``, ``q``, ``E_b`` and the products needed by tile shapes are baked
 # in as ``wp.constant`` values captured in the closure so the tile dimensions
-# are compile-time constants and the loops unroll. The factories are cached so
-# a given (n, q, E_b, dtype) shape compiles only once.
+# are compile-time constants and the loops unroll. ``fem_cache.dynamic_kernel``
+# dedupes by suffix, so a given (n, q, E_b, dtype) shape compiles only once.
 #
 # Each specialization is registered in its own dynamic module (via
 # ``fem_cache.dynamic_kernel``) rather than accumulating in this module:
 # appending kernels to a shared module changes its hash and recompiles every
 # previously built shape, making a sweep over (n, q, E_b) quadratic in CUDA
 # compile time. Isolated modules keep it linear and cache-stable.
+#
+# The contraction kernels do not need autodiff yet (design risk 9.7 defers AD),
+# hence ``enable_backward=False`` in every factory: with backward enabled every
+# tile_matmul builds three GEMM LTOs (forward + two adjoints), tripling the
+# first-run CUDA compile time of every kernel shape. Re-enable when the AD path
+# lands.
 
 
-@cache
 def make_interpolation_kernel_2d(n: int, q: int, element_batch: int, dtype):
     """Build (and cache) the 2D contraction kernel ``out_e = A @ U_e @ B^T``.
 
@@ -221,7 +217,6 @@ def make_interpolation_kernel_2d(n: int, q: int, element_batch: int, dtype):
     return kernel
 
 
-@cache
 def make_interpolation_kernel_3d(n: int, q: int, element_batch: int, dtype):
     """Build (and cache) the 3D contraction kernel ``out_e = (A,B,C) . U_e``.
 
@@ -468,61 +463,3 @@ def contract_transpose_3d(qvals, a_mat, b_mat, c_mat, n, q, element_batch=1, dev
     b_t = np.ascontiguousarray(np.asarray(b_mat).T)
     c_t = np.ascontiguousarray(np.asarray(c_mat).T)
     return _contract(qvals, (a_t, b_t, c_t), q, n, 3, element_batch, device)
-
-
-def contract_transpose_residual_2d(f0, f1_xi, f1_eta, interp, deriv, n, q, element_batch=1, device=None):
-    """Accumulate the 2D ``B^T`` residual ``r = ValueOp^T f0 + sum_axis GradOp_axis^T f1_axis``.
-
-    Convenience driver for the full ``B^T D B`` pipeline: the value coefficients
-    ``f0`` are contracted with ``Kron(I, I)^T`` and each reference-gradient
-    coefficient with the corresponding ``Kron(..., D_ref, ...)^T``, and the
-    ``1 + dim`` contributions are summed into a single residual. The
-    accumulation currently happens at the NumPy level (one kernel launch per
-    operator); a fused kernel is planned for the apply stage.
-
-    Args:
-        f0: ``(num_elements, q*q)`` value coefficients at the quadrature points.
-        f1_xi: ``(num_elements, q*q)`` ``d/dxi`` gradient coefficients.
-        f1_eta: ``(num_elements, q*q)`` ``d/deta`` gradient coefficients.
-        interp: ``(q, n)`` 1D interpolation matrix ``I``.
-        deriv: ``(q, n)`` 1D reference derivative matrix ``D_ref``.
-        n: Number of 1D nodes ``P + 1``.
-        q: Number of 1D quadrature points.
-        element_batch: Panel width ``E_b`` (default 1).
-        device: Warp device to run on.
-
-    Returns:
-        A ``(num_elements, n*n)`` NumPy array of accumulated nodal residuals.
-    """
-    residual = contract_transpose_2d(f0, interp, interp, n, q, element_batch, device)
-    residual += contract_transpose_2d(f1_xi, deriv, interp, n, q, element_batch, device)
-    residual += contract_transpose_2d(f1_eta, interp, deriv, n, q, element_batch, device)
-    return residual
-
-
-def contract_transpose_residual_3d(f0, f1_xi, f1_eta, f1_zeta, interp, deriv, n, q, element_batch=1, device=None):
-    """Accumulate the 3D ``B^T`` residual ``r = ValueOp^T f0 + sum_axis GradOp_axis^T f1_axis``.
-
-    3D counterpart of :func:`contract_transpose_residual_2d` with ``1 + dim = 4``
-    contributions.
-
-    Args:
-        f0: ``(num_elements, q^3)`` value coefficients at the quadrature points.
-        f1_xi: ``(num_elements, q^3)`` ``d/dxi`` gradient coefficients.
-        f1_eta: ``(num_elements, q^3)`` ``d/deta`` gradient coefficients.
-        f1_zeta: ``(num_elements, q^3)`` ``d/dzeta`` gradient coefficients.
-        interp: ``(q, n)`` 1D interpolation matrix ``I``.
-        deriv: ``(q, n)`` 1D reference derivative matrix ``D_ref``.
-        n: Number of 1D nodes ``P + 1``.
-        q: Number of 1D quadrature points.
-        element_batch: Panel width ``E_b`` (default 1).
-        device: Warp device to run on.
-
-    Returns:
-        A ``(num_elements, n^3)`` NumPy array of accumulated nodal residuals.
-    """
-    residual = contract_transpose_3d(f0, interp, interp, interp, n, q, element_batch, device)
-    residual += contract_transpose_3d(f1_xi, deriv, interp, interp, n, q, element_batch, device)
-    residual += contract_transpose_3d(f1_eta, interp, deriv, interp, n, q, element_batch, device)
-    residual += contract_transpose_3d(f1_zeta, interp, interp, deriv, n, q, element_batch, device)
-    return residual

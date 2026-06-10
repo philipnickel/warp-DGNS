@@ -22,29 +22,13 @@ from warp._src.fem.sumfac.qfunction import (
     extract_qfunction,
     reference_geometry_factors,
 )
-from warp._src.fem.sumfac.tensor_contract import (
-    build_operator_arrays,
-    interpolate_2d,
-    interpolate_3d,
-    make_interpolation_kernel_2d,
-    make_interpolation_kernel_3d,
-    pack_dofs_2d,
-    pack_dofs_3d,
-)
 
 __all__ = [
     "build_derivative_matrix",
     "build_interpolation_matrix",
-    "build_operator_arrays",
     "default_basis_nodes",
     "default_quadrature_points",
     "extract_qfunction",
-    "interpolate_2d",
-    "interpolate_3d",
-    "make_interpolation_kernel_2d",
-    "make_interpolation_kernel_3d",
     "make_sumfac_linear_operator",
-    "pack_dofs_2d",
-    "pack_dofs_3d",
     "reference_geometry_factors",
 ]
