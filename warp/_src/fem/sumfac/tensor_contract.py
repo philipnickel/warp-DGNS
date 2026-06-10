@@ -59,6 +59,7 @@ from functools import cache
 import numpy as np
 
 import warp as wp
+from warp._src.fem import cache as fem_cache
 from warp._src.fem.sumfac.operators_1d import (
     build_derivative_matrix,
     build_interpolation_matrix,
@@ -145,6 +146,12 @@ def pack_dofs_3d(dofs: np.ndarray, n: int) -> np.ndarray:
 # in as ``wp.constant`` values captured in the closure so the tile dimensions
 # are compile-time constants and the loops unroll. The factories are cached so
 # a given (n, q, E_b, dtype) shape compiles only once.
+#
+# Each specialization is registered in its own dynamic module (via
+# ``fem_cache.dynamic_kernel``) rather than accumulating in this module:
+# appending kernels to a shared module changes its hash and recompiles every
+# previously built shape, making a sweep over (n, q, E_b) quadratic in CUDA
+# compile time. Isolated modules keep it linear and cache-stable.
 
 
 @cache
@@ -179,7 +186,10 @@ def make_interpolation_kernel_2d(n: int, q: int, element_batch: int, dtype):
     qq_c = wp.constant(q * q)
     ebn_c = wp.constant(element_batch * n)
 
-    @wp.kernel
+    @fem_cache.dynamic_kernel(
+        suffix=f"contract2d_{n}_{q}_{element_batch}_{dtype.__name__}",
+        kernel_options={"enable_backward": False},
+    )
     def kernel(
         a_mat: wp.array2d(dtype=dtype),
         b_mat: wp.array2d(dtype=dtype),
@@ -247,7 +257,10 @@ def make_interpolation_kernel_3d(n: int, q: int, element_batch: int, dtype):
     qq_c = wp.constant(q * q)
     ebnn_c = wp.constant(element_batch * n * n)
 
-    @wp.kernel
+    @fem_cache.dynamic_kernel(
+        suffix=f"contract3d_{n}_{q}_{element_batch}_{dtype.__name__}",
+        kernel_options={"enable_backward": False},
+    )
     def kernel(
         a_mat: wp.array2d(dtype=dtype),
         b_mat: wp.array2d(dtype=dtype),
