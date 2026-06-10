@@ -77,6 +77,10 @@ isn't penalized by the d+1× factor.
 
 ## 5. Transparent dispatch & fallback
 
+> **Superseded (2026-06):** dispatch is now an explicit opt-in — `integrate(..., assembly="sumfac")`,
+> never selected automatically; unqualified forms raise instead of falling back. The conservative
+> checks below survive as the validation logic. See `design/sumfac-status.md`.
+
 Hook in `_generate_integrate_kernel` (`warp/_src/fem/integrate.py:1110`), before the existing
 linear/bilinear branches:
 

@@ -39,14 +39,16 @@ with a cuBLASDx LTO build (~1–4 min first run, cached afterwards). To keep ite
 - **Never run `-m warp.tests` in the development loop** — `warp/_src/thirdparty/unittest_parallel.py`
   clears the kernel cache at startup, so every suite invocation recompiles everything. Iterate with
   direct file runs (`uv run warp/tests/test_x.py`), which keep the cache warm. For a final suite
-  validation, set `WARP_CACHE_ROOT` to a throwaway directory so the run does not clobber the warm
+  validation, set `WARP_CACHE_PATH` to a throwaway directory so the run does not clobber the warm
   development cache.
 - Set `wp.set_module_options({"enable_backward": False})` in modules defining tile kernels unless
   AD is actually needed — with backward enabled every `tile_matmul` builds three GEMM LTOs
   (forward + two adjoints), tripling LTO compile time.
-- Minimize distinct tile shapes in tests: prefer degrees {1, 3, 5} over exhaustive 1..8 sweeps, a
-  single dtype (float64), small batch sets ({1, 4}), and a fixed `block_dim` (64 on CUDA — each
-  `block_dim` value is a separate module variant). Reuse shapes across tests where coverage allows.
+- Minimize distinct tile shapes in tests: GPU-compiling correctness tests use degree P=4
+  exclusively (n = q = 5 per axis, 2D and 3D), a single dtype (float64), and a fixed `block_dim`
+  (64 on CUDA — each `block_dim` value is a separate module variant). Keep exactly one rectangular
+  over-integration case (q != n) and one E_b > 1 batching case alongside it. Host-side NumPy tests
+  (no kernel compile) may sweep degrees freely. Reuse shapes across tests where coverage allows.
 - Iterate numerics CPU-first (compiles in seconds, no LTO), but always finish with one CUDA run:
   the cuBLASDx path has CUDA-only failure modes (e.g. strided `tile_view` operands are silently
   corrupt — see `warp/_src/fem/sumfac/tensor_contract.py`).

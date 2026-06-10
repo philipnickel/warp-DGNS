@@ -257,6 +257,10 @@ in files).
 
 ## Phase 3 · Apply + transparent dispatch (CPU correctness) — INTEGRATION GATE
 
+> **Superseded (2026-06):** the transparent dispatch was replaced by an explicit
+> `integrate(..., assembly="sumfac")` opt-in; unqualified forms raise instead of falling back.
+> See `design/sumfac-status.md`.
+
 **Goal:** Assemble the staged BᵀDB **apply** kernel from Phases 1–2; add `sumfac_applicable`
 and the dispatch hook in `_generate_integrate_kernel` (`integrate.py:1110`, before the existing
 linear/bilinear branches); expose a matrix-free `LinearOperator`. **Spec risk §9.1 spike first:**
