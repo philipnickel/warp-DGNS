@@ -57,3 +57,36 @@ faces; move block-uniform per-face metadata out of per-thread registers; comment
 (sound) full-width-row-block tile_view convention at its 8 call sites; replace the
 wp.min(2, cell_index+2) unroll-defeat with a plain int kernel arg; add domain.name directly
 to the cache suffix (currently discriminated only indirectly via quadrature.name).
+
+## Core reference (added 2026-06-10)
+
+Tu, Karlin, Camier, Dobrev, Kolev, Henneking, Ghattas, **"Accelerating High-Order Finite
+Element Simulations at Extreme Scale with FP64 Tensor Cores"**, arXiv:2603.09038 (MFEM /
+2025 Gordon Bell tsunami digital twin; GH200/GB200, 9,216 GPUs). THE core reference for this
+project. What it establishes, and how it re-ranks our plan:
+
+- **Validates the architecture end to end**: fused sum-factorized B^T D B on FP64 DMMA gives
+  2x (35-59% from DMMA alone, the rest from fusion) at p=3/4 with our exact GEMM shapes
+  (m25n5k4). Mechanism: shared-memory DATA MOTION is the bottleneck, not FLOPs (baseline 97%
+  LSU wavefronts vs 14% FP64 pipe; DMMA cuts smem reads 4.6x, 9000->1960 B per GEMM). They
+  reject CUTLASS/cuBLAS padding for O(10) GEMMs and name cuBLASDx as the future alternative
+  to their inline PTX -- i.e. our Warp-tiles/cuBLASDx stack is the layer they predicted.
+- **What it does NOT cover (our open territory)**: no interior DG faces at all (mixed
+  Galerkin, boundary integrals only); no multi-element batching into MMA tiles (they accept
+  ~49% instruction-lane waste at m25n5 -- the waste E_b panels exist to eliminate); no A100
+  data; no order sweep; no DMMA-vs-FMA rounding analysis.
+- **Re-ranked side-kernel fix plan (evidence-weighted)**: (1) E_b multi-cell panels +
+  stacked opposing-face operators (their admitted lane waste + "discretize to fit the
+  tensor-core architecture" make tile-filling the dominant lever; our (2,n) GEMMs waste >75%
+  of the m-extent); (2) fused/stacked side stages (fusion was half their 2x); (3) hoist
+  side-constant geometry PA-style -- their Fused-PA beats Fused-MF in runtime DESPITE worse
+  roofline position ("gains in FLOP/s efficiency are outweighed by the additional FLOPs"),
+  which also cautions the deep-GEMM bilinear: judge by ms/apply, never by utilization;
+  (4) block_dim/redundancy (their GEMMs use 4 cooperating warps).
+- **New levers**: cyclic tensor-index reordering (contracted index always fastest-changing;
+  removes transposes and makes stages bank-conflict-free) for tensor_contract staging;
+  Nsight diagnostic pair "L1: Data Pipe Lsu Wavefronts" vs "SM: Pipe Fp64/Dmma Cycles
+  Active" for the A100 pass; report GDOF/s and MDOF/Watt (capture power via NVML).
+- **A100 expectation setting**: A100 FP64-TC peak is 19.5 TFLOP/s (~3.4x below H100's 67);
+  related work (CEED-MS40) saw DMMA gains on A100 "mainly for orders above 10" -- at P=4
+  the win must come from filling tiles (E_b/stacking), not from DMMA per se.
