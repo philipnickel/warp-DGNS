@@ -52,9 +52,9 @@ from warp._src.context import capture_pause, capture_resume
 from warp._src.fem import cache
 from warp._src.fem import operator as fem_operator
 from warp._src.fem.domain import GeometryDomain
-from warp._src.fem.field import TestField
+from warp._src.fem.field import TestField, TrialField
 from warp._src.fem.field.nodal_field import NodalField
-from warp._src.fem.field.virtual import SeedField, ValueInjectedField
+from warp._src.fem.field.virtual import SeedField, TrialSeedField, ValueInjectedField
 from warp._src.fem.polynomial import quadrature_1d
 from warp._src.fem.quadrature import Quadrature, RegularQuadrature
 from warp._src.fem.space import FunctionSpace, SpacePartition
@@ -75,10 +75,15 @@ from warp._src.optim.linear import LinearOperator
 from warp._src.types import type_scalar_type
 
 __all__ = [
+    "SumfacBilinearPlan",
     "SumfacPlan",
+    "find_sumfac_bilinear_layout",
     "find_sumfac_layout",
+    "get_integrate_bilinear_sumfac_kernel",
     "get_integrate_linear_sumfac_kernel",
     "get_sumfac_scatter_kernel",
+    "get_sumfac_triplet_fill_kernel",
+    "make_sumfac_bilinear_plan",
     "make_sumfac_linear_operator",
     "make_sumfac_plan",
     "sumfac_block_dim",
@@ -234,6 +239,37 @@ def _is_tensor_product_scalar_dg_space(space: FunctionSpace, dim: int) -> bool:
     return space.topology.MAX_NODES_PER_ELEMENT == (degree + 1) ** dim
 
 
+def _find_tensor_product_core(
+    test: TestField,
+    quadrature: Quadrature,
+    domain: GeometryDomain,
+) -> tuple[int, np.ndarray] | None:
+    """Verify the geometric/space/quadrature assumptions shared by the apply and assembly paths.
+
+    Returns ``(dim, qpoints_1d)`` for a cell domain over a tensor-product
+    geometry with a scalar discontinuous tensor-product test space and a
+    matching lexicographic tensor-product :class:`RegularQuadrature`, else
+    ``None``.
+    """
+    if domain.element_kind != ElementKind.CELL:
+        return None
+    geometry = domain.geometry
+    dim = geometry.dimension
+    if dim not in (2, 3) or geometry.cell_dimension != dim:
+        return None
+
+    if not _is_tensor_product_scalar_dg_space(test.space, dim):
+        return None
+
+    if not isinstance(quadrature, RegularQuadrature) or quadrature.domain != domain:
+        return None
+    qpoints_1d = _tensor_product_quadrature_points_1d(quadrature, dim)
+    if qpoints_1d is None:
+        return None
+
+    return dim, qpoints_1d
+
+
 def find_sumfac_layout(
     integrand,
     arguments,
@@ -255,22 +291,11 @@ def find_sumfac_layout(
         quadrature: Quadrature formula of the integration.
         domain: Integration domain.
     """
-    if domain.element_kind != ElementKind.CELL:
+    core = _find_tensor_product_core(test, quadrature, domain)
+    if core is None:
         return None
-    geometry = domain.geometry
-    dim = geometry.dimension
-    if dim not in (2, 3) or geometry.cell_dimension != dim:
-        return None
-
+    dim, qpoints_1d = core
     space = test.space
-    if not _is_tensor_product_scalar_dg_space(space, dim):
-        return None
-
-    if not isinstance(quadrature, RegularQuadrature) or quadrature.domain != domain:
-        return None
-    qpoints_1d = _tensor_product_quadrature_points_1d(quadrature, dim)
-    if qpoints_1d is None:
-        return None
 
     if integrand.operators is None:
         return None
@@ -359,6 +384,217 @@ def make_sumfac_plan(
         interp=interp,
         deriv=deriv,
         test_uses_grad=layout.test_uses_grad,
+    )
+
+
+# -- Bilinear (assembly) path ---------------------------------------------------
+#
+# For a bilinear form a(u, v), linear in both arguments, the per-quadrature-
+# point D stage is the (1 + d) x (1 + d) channel matrix
+#   c[a, b](qp) = w |J| * integrand(test seed a, trial seed b)
+# (seed 0 = value, seed 1 + i = physical gradient e_i; gradient channels are
+# mapped to reference space with J^{-1} on both sides). The element-local
+# block is then
+#   K_e = sum_{a, b} B_a^T diag(c[a, b]) B_b
+# with B_0 the value interpolation operator and B_{1+i} the reference-
+# gradient operator along axis i. The fused kernel evaluates the channels
+# ONCE per element ((1+d)^2 q^d integrand evaluations instead of the naive
+# n^{2d} q^d), then forms K_e column by column as the B^T D B action on the
+# n^d one-hot trial vectors, reusing the Phase 1/3 contraction pipelines:
+# O(d n^d q) tile FLOPs per column, O(d n^{2d} q) per element overall versus
+# the naive O(n^{2d} q^d).
+
+#: Conservative shared-memory budget (bytes) for the fused bilinear kernel's
+#: tile working set. Shapes whose estimated footprint exceeds it do not
+#: qualify (the caller falls back to the legacy kernels) instead of failing
+#: at module load; the A100-class opt-in limit is ~163 KiB and the estimate
+#: deliberately keeps a wide margin for codegen temporaries.
+SUMFAC_BILINEAR_SMEM_BUDGET = 96 * 1024
+
+
+def _sumfac_bilinear_smem_estimate(n: int, q: int, dim: int, scalar_bytes: int) -> int:
+    """Estimate the fused bilinear kernel's live tile footprint in bytes (full-gradient case)."""
+    nch = (1 + dim) ** 2
+    ops = 4 * q * n
+    if dim == 2:
+        channels = nch * q * q
+        column = n * n + 2 * q * n + 3 * q * q  # one-hot DOFs, B stages, (value, grad) at QPs
+        combine = 2 * 3 * q * q  # f tiles and elementwise temporaries
+        backward = 3 * n * q + n * n
+    else:
+        channels = nch * q * q * q
+        column = n**3 + 2 * q * n * n + 4 * q**3  # one-hot DOFs, B stages, (value, grad) at QPs
+        column += 3 * q * n + 4 * q * q  # per-slab intermediates
+        combine = 2 * 4 * q**3
+        backward = 4 * n * q * q + 4 * n * q + n * n + n**3
+    # Safety factor for expression temporaries and allocator padding
+    return int(1.5 * scalar_bytes * (ops + channels + column + combine + backward))
+
+
+@dataclass
+class SumfacBilinearLayout:
+    """Host-side description of a qualifying tensor-product bilinear form."""
+
+    degree: int
+    n: int
+    q: int
+    dim: int
+    qpoints_1d: np.ndarray
+    test_uses_grad: bool
+    trial_uses_grad: bool
+
+
+@dataclass
+class SumfacBilinearPlan:
+    """Launch-side description of a sum-factorized bilinear-form assembly.
+
+    Built by :func:`make_sumfac_bilinear_plan` once a form has qualified;
+    carries the substituted :class:`SeedField`/:class:`TrialSeedField`
+    instances, the baked tile sizes, and the host 1D operator matrices.
+    """
+
+    test: TestField
+    trial: TrialField
+    test_name: str
+    trial_name: str
+    test_seed: SeedField
+    trial_seed: TrialSeedField
+    degree: int
+    n: int
+    q: int
+    dim: int
+    element_batch: int
+    interp: np.ndarray
+    deriv: np.ndarray
+    test_uses_grad: bool
+    trial_uses_grad: bool
+
+    @property
+    def nodes_per_element(self) -> int:
+        """Number of nodes per element, ``n**dim``."""
+        return self.n**self.dim
+
+    def operator_arrays(self, dtype, device) -> tuple[wp.array, wp.array]:
+        """Return the ``(interp, deriv)`` device arrays in ``dtype`` on ``device``, cached."""
+        return _get_operator_arrays(self.interp, self.deriv, dtype, device)
+
+
+def find_sumfac_bilinear_layout(
+    integrand,
+    arguments,
+    test: TestField,
+    trial: TrialField,
+    quadrature: Quadrature,
+    domain: GeometryDomain,
+) -> SumfacBilinearLayout | None:
+    """Return the sum-factorization layout for a bilinear form if it qualifies, else ``None``.
+
+    In addition to the structural requirements of :func:`find_sumfac_layout`'s
+    core (cell domain, tensor-product discontinuous scalar test space,
+    lexicographic tensor-product quadrature), the trial field must be defined
+    over the *same* function space as the test field (mixed test/trial spaces
+    are rejected) and accessed only through value/gradient operators, and the
+    fused kernel's estimated tile working set must fit the shared-memory
+    budget.
+
+    Args:
+        integrand: The form being integrated; ``integrand.operators`` must
+            have been populated (via ``_find_integrand_operators``).
+        arguments: Parsed integrand arguments (before field substitution).
+        test: The (plain) test field of the bilinear form.
+        trial: The (plain) trial field of the bilinear form.
+        quadrature: Quadrature formula of the integration.
+        domain: Integration domain.
+    """
+    core = _find_tensor_product_core(test, quadrature, domain)
+    if core is None:
+        return None
+    dim, qpoints_1d = core
+    space = test.space
+
+    # Same scalar space on both sides; the column node indexing and the
+    # shared 1D operators both assume it.
+    if trial.space.name != space.name:
+        return None
+    if trial.space.NODE_DOF_COUNT != 1 or trial.space.VALUE_DOF_COUNT != 1:
+        return None
+
+    if integrand.operators is None:
+        return None
+    test_operators = integrand.operators.get(arguments.test_name, set())
+    if not test_operators <= _SUPPORTED_TEST_OPERATORS:
+        return None
+    trial_operators = integrand.operators.get(arguments.trial_name, set())
+    if not trial_operators <= _SUPPORTED_TEST_OPERATORS:
+        return None
+
+    degree = space.degree
+    n = degree + 1
+    q = len(qpoints_1d)
+    scalar_bytes = 4 if type_scalar_type(space.dtype) == wp.float32 else 8
+    if _sumfac_bilinear_smem_estimate(n, q, dim, scalar_bytes) > SUMFAC_BILINEAR_SMEM_BUDGET:
+        return None
+
+    grad_operators = {fem_operator.grad, fem_operator.grad_outer}
+    return SumfacBilinearLayout(
+        degree=degree,
+        n=n,
+        q=q,
+        dim=dim,
+        qpoints_1d=qpoints_1d,
+        test_uses_grad=bool(grad_operators & test_operators),
+        trial_uses_grad=bool(grad_operators & trial_operators),
+    )
+
+
+def make_sumfac_bilinear_plan(
+    integrand,
+    arguments,
+    test: TestField,
+    trial: TrialField,
+    quadrature: Quadrature,
+    domain: GeometryDomain,
+    element_batch: int = SUMFAC_ELEMENT_BATCH,
+) -> SumfacBilinearPlan | None:
+    """Build the assembly launch plan and substitute the seed fields in ``arguments``.
+
+    On success, ``arguments.field_args`` is mutated in place: the test field
+    is replaced by a :class:`SeedField` and the trial field by a
+    :class:`TrialSeedField`, so that the downstream ``FieldStruct`` /
+    ``IntegrandTransformer`` machinery generates the in-kernel channel
+    extraction. Returns ``None`` if the form does not qualify (no mutation
+    happens).
+    """
+    layout = find_sumfac_bilinear_layout(integrand, arguments, test, trial, quadrature, domain)
+    if layout is None:
+        return None
+
+    shape = test.space.basis.shape
+    nodes_1d = np.asarray(quadrature_1d(point_count=layout.n, family=shape.family)[0], dtype=np.float64)
+    interp = build_interpolation_matrix(nodes_1d, layout.qpoints_1d)
+    deriv = build_derivative_matrix(nodes_1d, layout.qpoints_1d)
+
+    test_seed = SeedField.from_field(test)
+    trial_seed = TrialSeedField.from_field(trial)
+    arguments.field_args[arguments.test_name] = test_seed
+    arguments.field_args[arguments.trial_name] = trial_seed
+
+    return SumfacBilinearPlan(
+        test=test,
+        trial=trial,
+        test_name=arguments.test_name,
+        trial_name=arguments.trial_name,
+        test_seed=test_seed,
+        trial_seed=trial_seed,
+        degree=layout.degree,
+        n=layout.n,
+        q=layout.q,
+        dim=layout.dim,
+        element_batch=element_batch,
+        interp=interp,
+        deriv=deriv,
+        test_uses_grad=layout.test_uses_grad,
+        trial_uses_grad=layout.trial_uses_grad,
     )
 
 
@@ -756,6 +992,467 @@ def get_integrate_linear_sumfac_kernel(
         wp.tile_store(result_elem, r_flat, offset=(domain_element_index, 0))
 
     return integrate_kernel_fn
+
+
+def get_integrate_bilinear_sumfac_kernel(
+    integrand_func: wp.Function,
+    domain: GeometryDomain,
+    quadrature: Quadrature,
+    FieldStruct,
+    ValueStruct,
+    test: TestField,
+    trial: TrialField,
+    *,
+    n: int,
+    q: int,
+    dim: int,
+    element_batch: int,
+    test_uses_grad: bool,
+    trial_uses_grad: bool,
+    accumulate_dtype,
+):
+    """Build the fused sum-factorized assembly kernel body for a qualifying bilinear form.
+
+    Returns a ``kernel_fn`` closure to be compiled through
+    ``cache.get_integrand_kernel`` with a ``PassFieldArgsToIntegrand`` code
+    transformer, exactly like the other ``get_integrate_*_kernel`` factories
+    in :mod:`warp._src.fem.integrate`. Unlike the linear apply kernel, no
+    field injection is needed: both the test and the trial field have been
+    substituted with seed fields whose selectors travel through the
+    ``Sample``, so the kernel's ``fields`` argument is passed to the
+    transformed integrand unchanged.
+
+    The kernel is launched with ``wp.launch_tiled(dim=[element_count])``, one
+    element per block. Per element it first evaluates the per-quadrature-
+    point channel coefficients ``c[a, b]`` (the ``D`` stage, ``(1 + d)^2``
+    seeded integrand evaluations per point, gradient channels mapped to
+    reference space with ``J^{-1}`` on both sides), then forms the local
+    block column by column as the ``B^T D B`` action on the one-hot trial
+    vectors, storing each column to the per-element staging array. All loops
+    have compile-time bounds and there are no early returns (uniform control
+    flow over the tile operations).
+
+    Args:
+        integrand_func: Transformed integrand (with the seed fields
+            substituted).
+        domain: Cell domain of the integration.
+        quadrature: Tensor-product quadrature formula.
+        FieldStruct: Generated field-argument struct (post-substitution).
+        ValueStruct: Generated value-argument struct.
+        test: Original (plain) test field.
+        trial: Original (plain) trial field (same space as ``test``).
+        n: Nodes per axis of the (test and trial) space, ``degree + 1``.
+        q: Quadrature points per axis.
+        dim: Spatial dimension (2 or 3).
+        element_batch: Elements per block; only ``1`` is implemented.
+        test_uses_grad: Whether the integrand applies a gradient operator to
+            the test field; when ``False`` the test gradient channels are
+            omitted entirely (matching the legacy dispatch path).
+        trial_uses_grad: Same for the trial field.
+        accumulate_dtype: Scalar type used for the tile contractions and
+            coefficient accumulation.
+    """
+    if element_batch != 1:
+        raise NotImplementedError("Sum-factorized integration currently requires element_batch == 1")
+
+    SampleType = domain.geometry.sample_type
+    value_type = type_scalar_type(test.dtype)
+    grad_type = test.gradient_dtype
+    chmat_type = cache.cached_mat_type(shape=(dim + 1, dim + 1), dtype=value_type)
+
+    TEST_CHANNELS = 1 + (dim if test_uses_grad else 0)
+    TRIAL_CHANNELS = 1 + (dim if trial_uses_grad else 0)
+
+    # Flat loops with index arithmetic (see get_integrate_linear_sumfac_kernel)
+    n_c = wp.constant(n)
+    q_c = wp.constant(q)
+    nn_c = wp.constant(n * n)
+    qq_c = wp.constant(q * q)
+
+    if dim == 2:
+
+        def integrate_kernel_fn(
+            qp_arg: quadrature.Arg,
+            domain_arg: domain.ElementArg,
+            domain_index_arg: domain.ElementIndexArg,
+            fields: FieldStruct,
+            values: ValueStruct,
+            interp: wp.array2d(dtype=accumulate_dtype),
+            deriv: wp.array2d(dtype=accumulate_dtype),
+            staging: wp.array2d(dtype=accumulate_dtype),
+        ):
+            domain_element_index = wp.tid()
+            element_index = domain.element_index(domain_index_arg, domain_element_index)
+
+            a_tile = wp.tile_load(interp, shape=(q_c, n_c))
+            d_tile = wp.tile_load(deriv, shape=(q_c, n_c))
+            a_t = wp.tile_transpose(a_tile)
+            d_t = wp.tile_transpose(d_tile)
+
+            # --- D stage: seeded channel coefficients at every quadrature point
+            c_vv = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+            if wp.static(trial_uses_grad):
+                c_vg_x = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+                c_vg_y = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+            if wp.static(test_uses_grad):
+                c_gv_x = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+                c_gv_y = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+            if wp.static(test_uses_grad and trial_uses_grad):
+                c_gg_xx = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+                c_gg_xy = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+                c_gg_yx = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+                c_gg_yy = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+
+            for qp in range(qq_c):
+                qx = qp // q_c
+                qy = qp - qx * q_c
+                qp_index = quadrature.point_index(domain_arg, qp_arg, domain_element_index, element_index, qp)
+                qp_coords = quadrature.point_coords(domain_arg, qp_arg, domain_element_index, element_index, qp)
+                qp_weight = quadrature.point_weight(domain_arg, qp_arg, domain_element_index, element_index, qp)
+
+                free_sample = make_free_sample(element_index, qp_coords)
+                vol = domain.element_measure(domain_arg, free_sample)
+                scale = accumulate_dtype(qp_weight * vol)
+                jac = domain.element_deformation_gradient(domain_arg, free_sample)
+                jac_inv = wp.inverse(jac)
+
+                # Physical channel matrix: integrand at (test seed a, trial seed b)
+                ch = chmat_type()
+                for a in range(TEST_CHANNELS):
+                    for b in range(TRIAL_CHANNELS):
+                        sample = SampleType(
+                            element_index, qp_coords, qp_index, qp_weight, DofIndex(a, 0), DofIndex(b, 0)
+                        )
+                        ch[a, b] = value_type(integrand_func(sample, fields, values))
+
+                # Map the physical gradient channels to reference space with
+                # J^{-1} on both sides (grad_phys = J^{-T} grad_ref).
+                if wp.static(test_uses_grad):
+                    for b in range(TRIAL_CHANNELS):
+                        gv = jac_inv * grad_type(ch[1, b], ch[2, b])
+                        ch[1, b] = gv[0]
+                        ch[2, b] = gv[1]
+                if wp.static(trial_uses_grad):
+                    for a in range(TEST_CHANNELS):
+                        gu = jac_inv * grad_type(ch[a, 1], ch[a, 2])
+                        ch[a, 1] = gu[0]
+                        ch[a, 2] = gu[1]
+
+                c_vv[qx, qy] = scale * accumulate_dtype(ch[0, 0])
+                if wp.static(trial_uses_grad):
+                    c_vg_x[qx, qy] = scale * accumulate_dtype(ch[0, 1])
+                    c_vg_y[qx, qy] = scale * accumulate_dtype(ch[0, 2])
+                if wp.static(test_uses_grad):
+                    c_gv_x[qx, qy] = scale * accumulate_dtype(ch[1, 0])
+                    c_gv_y[qx, qy] = scale * accumulate_dtype(ch[2, 0])
+                if wp.static(test_uses_grad and trial_uses_grad):
+                    c_gg_xx[qx, qy] = scale * accumulate_dtype(ch[1, 1])
+                    c_gg_xy[qx, qy] = scale * accumulate_dtype(ch[1, 2])
+                    c_gg_yx[qx, qy] = scale * accumulate_dtype(ch[2, 1])
+                    c_gg_yy[qx, qy] = scale * accumulate_dtype(ch[2, 2])
+
+            # --- Local block, column by column: B^T D B on one-hot trial vectors
+            for col in range(nn_c):
+                j1 = col // n_c
+                j2 = col - j1 * n_c
+                u_mat = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)
+                u_mat[j1, j2] = accumulate_dtype(1.0)
+
+                # B stage: one-hot trial values (and reference gradients) at QPs
+                stage_i = wp.tile_matmul(a_tile, u_mat)  # (q, n) [qx, j]
+                uq = wp.tile_matmul(stage_i, a_t)  # value [qx, qy]
+                if wp.static(trial_uses_grad):
+                    stage_d = wp.tile_matmul(d_tile, u_mat)
+                    g_xi = wp.tile_matmul(stage_d, a_t)
+                    g_eta = wp.tile_matmul(stage_i, d_t)
+
+                # Channel combine: f_a = sum_b c[a, b] * phi_b
+                if wp.static(trial_uses_grad):
+                    f0 = c_vv * uq + c_vg_x * g_xi + c_vg_y * g_eta
+                else:
+                    f0 = c_vv * uq
+                if wp.static(test_uses_grad and trial_uses_grad):
+                    f1_xi = c_gv_x * uq + c_gg_xx * g_xi + c_gg_xy * g_eta
+                    f1_eta = c_gv_y * uq + c_gg_yx * g_xi + c_gg_yy * g_eta
+                elif wp.static(test_uses_grad):
+                    f1_xi = c_gv_x * uq
+                    f1_eta = c_gv_y * uq
+
+                # B^T stage: contract the coefficients back to test nodal values
+                r = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)
+                tmp0 = wp.tile_matmul(a_t, f0)  # (n, q)
+                wp.tile_matmul(tmp0, a_tile, r)
+                if wp.static(test_uses_grad):
+                    tmp1 = wp.tile_matmul(d_t, f1_xi)
+                    wp.tile_matmul(tmp1, a_tile, r)
+                    tmp2 = wp.tile_matmul(a_t, f1_eta)
+                    wp.tile_matmul(tmp2, d_tile, r)
+
+                r_flat = wp.tile_reshape(r, shape=(1, nn_c))
+                wp.tile_store(staging, r_flat, offset=(domain_element_index * nn_c + col, 0))
+
+        return integrate_kernel_fn
+
+    nnn_c = wp.constant(n * n * n)
+    qqq_c = wp.constant(q * q * q)
+
+    def integrate_kernel_fn(
+        qp_arg: quadrature.Arg,
+        domain_arg: domain.ElementArg,
+        domain_index_arg: domain.ElementIndexArg,
+        fields: FieldStruct,
+        values: ValueStruct,
+        interp: wp.array2d(dtype=accumulate_dtype),
+        deriv: wp.array2d(dtype=accumulate_dtype),
+        staging: wp.array2d(dtype=accumulate_dtype),
+    ):
+        domain_element_index = wp.tid()
+        element_index = domain.element_index(domain_index_arg, domain_element_index)
+
+        a_tile = wp.tile_load(interp, shape=(q_c, n_c))
+        d_tile = wp.tile_load(deriv, shape=(q_c, n_c))
+        a_t = wp.tile_transpose(a_tile)
+        d_t = wp.tile_transpose(d_tile)
+
+        # --- D stage: seeded channel coefficients at every quadrature point
+        c_vv = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)  # [qx, qy*q + qz]
+        if wp.static(trial_uses_grad):
+            c_vg_x = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_vg_y = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_vg_z = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+        if wp.static(test_uses_grad):
+            c_gv_x = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gv_y = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gv_z = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+        if wp.static(test_uses_grad and trial_uses_grad):
+            c_gg_xx = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gg_xy = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gg_xz = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gg_yx = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gg_yy = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gg_yz = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gg_zx = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gg_zy = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+            c_gg_zz = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+
+        for qp in range(qqq_c):
+            qx = qp // qq_c
+            idx = qp - qx * qq_c  # qy * q + qz
+            qp_index = quadrature.point_index(domain_arg, qp_arg, domain_element_index, element_index, qp)
+            qp_coords = quadrature.point_coords(domain_arg, qp_arg, domain_element_index, element_index, qp)
+            qp_weight = quadrature.point_weight(domain_arg, qp_arg, domain_element_index, element_index, qp)
+
+            free_sample = make_free_sample(element_index, qp_coords)
+            vol = domain.element_measure(domain_arg, free_sample)
+            scale = accumulate_dtype(qp_weight * vol)
+            jac = domain.element_deformation_gradient(domain_arg, free_sample)
+            jac_inv = wp.inverse(jac)
+
+            # Physical channel matrix: integrand at (test seed a, trial seed b)
+            ch = chmat_type()
+            for a in range(TEST_CHANNELS):
+                for b in range(TRIAL_CHANNELS):
+                    sample = SampleType(element_index, qp_coords, qp_index, qp_weight, DofIndex(a, 0), DofIndex(b, 0))
+                    ch[a, b] = value_type(integrand_func(sample, fields, values))
+
+            # Map the physical gradient channels to reference space with
+            # J^{-1} on both sides (grad_phys = J^{-T} grad_ref).
+            if wp.static(test_uses_grad):
+                for b in range(TRIAL_CHANNELS):
+                    gv = jac_inv * grad_type(ch[1, b], ch[2, b], ch[3, b])
+                    ch[1, b] = gv[0]
+                    ch[2, b] = gv[1]
+                    ch[3, b] = gv[2]
+            if wp.static(trial_uses_grad):
+                for a in range(TEST_CHANNELS):
+                    gu = jac_inv * grad_type(ch[a, 1], ch[a, 2], ch[a, 3])
+                    ch[a, 1] = gu[0]
+                    ch[a, 2] = gu[1]
+                    ch[a, 3] = gu[2]
+
+            c_vv[qx, idx] = scale * accumulate_dtype(ch[0, 0])
+            if wp.static(trial_uses_grad):
+                c_vg_x[qx, idx] = scale * accumulate_dtype(ch[0, 1])
+                c_vg_y[qx, idx] = scale * accumulate_dtype(ch[0, 2])
+                c_vg_z[qx, idx] = scale * accumulate_dtype(ch[0, 3])
+            if wp.static(test_uses_grad):
+                c_gv_x[qx, idx] = scale * accumulate_dtype(ch[1, 0])
+                c_gv_y[qx, idx] = scale * accumulate_dtype(ch[2, 0])
+                c_gv_z[qx, idx] = scale * accumulate_dtype(ch[3, 0])
+            if wp.static(test_uses_grad and trial_uses_grad):
+                c_gg_xx[qx, idx] = scale * accumulate_dtype(ch[1, 1])
+                c_gg_xy[qx, idx] = scale * accumulate_dtype(ch[1, 2])
+                c_gg_xz[qx, idx] = scale * accumulate_dtype(ch[1, 3])
+                c_gg_yx[qx, idx] = scale * accumulate_dtype(ch[2, 1])
+                c_gg_yy[qx, idx] = scale * accumulate_dtype(ch[2, 2])
+                c_gg_yz[qx, idx] = scale * accumulate_dtype(ch[2, 3])
+                c_gg_zx[qx, idx] = scale * accumulate_dtype(ch[3, 1])
+                c_gg_zy[qx, idx] = scale * accumulate_dtype(ch[3, 2])
+                c_gg_zz[qx, idx] = scale * accumulate_dtype(ch[3, 3])
+
+        # --- Local block, column by column: B^T D B on one-hot trial vectors
+        for col in range(nnn_c):
+            j1 = col // nn_c
+            jk = col - j1 * nn_c  # j2 * n + j3
+            u_mat = wp.tile_zeros(shape=(n_c, nn_c), dtype=accumulate_dtype)  # [i, j*n + k]
+            u_mat[j1, jk] = accumulate_dtype(1.0)
+
+            # B stage: one-hot trial values (and reference gradients) at QPs
+            stage_i = wp.tile_matmul(a_tile, u_mat)  # (q, n^2) [qx, j*n + k]
+            if wp.static(trial_uses_grad):
+                stage_d = wp.tile_matmul(d_tile, u_mat)
+
+            uq = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)  # [qx, qy*q + qz]
+            if wp.static(trial_uses_grad):
+                g_xi = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+                g_eta = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+                g_zeta = wp.tile_zeros(shape=(q_c, qq_c), dtype=accumulate_dtype)
+
+            for qx in range(q_c):
+                row_i = wp.tile_view(stage_i, offset=(qx, 0), shape=(1, nn_c))
+                block_i = wp.tile_reshape(row_i, shape=(n_c, n_c))  # [j, k]
+                slab_ii = wp.tile_matmul(a_tile, block_i)  # (q, n) [qy, k]
+                val_qx = wp.tile_matmul(slab_ii, a_t)  # (q, q) [qy, qz]
+                wp.tile_assign(uq, wp.tile_reshape(val_qx, shape=(1, qq_c)), offset=(qx, 0))
+
+                if wp.static(trial_uses_grad):
+                    row_d = wp.tile_view(stage_d, offset=(qx, 0), shape=(1, nn_c))
+                    block_d = wp.tile_reshape(row_d, shape=(n_c, n_c))
+                    slab_di = wp.tile_matmul(d_tile, block_i)
+                    slab_id = wp.tile_matmul(a_tile, block_d)
+                    gz_qx = wp.tile_matmul(slab_ii, d_t)
+                    gy_qx = wp.tile_matmul(slab_di, a_t)
+                    gx_qx = wp.tile_matmul(slab_id, a_t)
+                    wp.tile_assign(g_xi, wp.tile_reshape(gx_qx, shape=(1, qq_c)), offset=(qx, 0))
+                    wp.tile_assign(g_eta, wp.tile_reshape(gy_qx, shape=(1, qq_c)), offset=(qx, 0))
+                    wp.tile_assign(g_zeta, wp.tile_reshape(gz_qx, shape=(1, qq_c)), offset=(qx, 0))
+
+            # Channel combine: f_a = sum_b c[a, b] * phi_b
+            if wp.static(trial_uses_grad):
+                f0 = c_vv * uq + c_vg_x * g_xi + c_vg_y * g_eta + c_vg_z * g_zeta
+            else:
+                f0 = c_vv * uq
+            if wp.static(test_uses_grad and trial_uses_grad):
+                f1_xi = c_gv_x * uq + c_gg_xx * g_xi + c_gg_xy * g_eta + c_gg_xz * g_zeta
+                f1_eta = c_gv_y * uq + c_gg_yx * g_xi + c_gg_yy * g_eta + c_gg_yz * g_zeta
+                f1_zeta = c_gv_z * uq + c_gg_zx * g_xi + c_gg_zy * g_eta + c_gg_zz * g_zeta
+            elif wp.static(test_uses_grad):
+                f1_xi = c_gv_x * uq
+                f1_eta = c_gv_y * uq
+                f1_zeta = c_gv_z * uq
+
+            # B^T stage: contract the coefficients back to test nodal values
+            g0 = wp.tile_matmul(a_t, f0)  # (n, q^2) [i, qy*q + qz]
+            if wp.static(test_uses_grad):
+                g1 = wp.tile_matmul(d_t, f1_xi)
+                g2 = wp.tile_matmul(a_t, f1_eta)
+                g3 = wp.tile_matmul(a_t, f1_zeta)
+
+            r = wp.tile_zeros(shape=(n_c, nn_c), dtype=accumulate_dtype)  # [i, j*n + k]
+            for i in range(n_c):
+                b0 = wp.tile_reshape(wp.tile_view(g0, offset=(i, 0), shape=(1, qq_c)), shape=(q_c, q_c))  # [qy, qz]
+                h0 = wp.tile_matmul(a_t, b0)  # (n, q) [j, qz]
+
+                r_blk = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)  # [j, k]
+                wp.tile_matmul(h0, a_tile, r_blk)
+
+                if wp.static(test_uses_grad):
+                    b1 = wp.tile_reshape(wp.tile_view(g1, offset=(i, 0), shape=(1, qq_c)), shape=(q_c, q_c))
+                    b2 = wp.tile_reshape(wp.tile_view(g2, offset=(i, 0), shape=(1, qq_c)), shape=(q_c, q_c))
+                    b3 = wp.tile_reshape(wp.tile_view(g3, offset=(i, 0), shape=(1, qq_c)), shape=(q_c, q_c))
+
+                    h1 = wp.tile_matmul(a_t, b1)
+                    h2 = wp.tile_matmul(d_t, b2)
+                    h3 = wp.tile_matmul(a_t, b3)
+
+                    wp.tile_matmul(h1, a_tile, r_blk)
+                    wp.tile_matmul(h2, a_tile, r_blk)
+                    wp.tile_matmul(h3, d_tile, r_blk)
+
+                wp.tile_assign(r, wp.tile_reshape(r_blk, shape=(1, nn_c)), offset=(i, 0))
+
+            r_flat = wp.tile_reshape(r, shape=(1, nnn_c))
+            wp.tile_store(staging, r_flat, offset=(domain_element_index * nnn_c + col, 0))
+
+    return integrate_kernel_fn
+
+
+def get_sumfac_triplet_fill_kernel(
+    domain: GeometryDomain,
+    test: TestField,
+    trial: TrialField,
+    staging_dtype,
+    output_dtype,
+):
+    """Build (and cache) the kernel scattering per-element local blocks to BSR triplets.
+
+    The fused assembly kernel stores column ``j`` of element ``e``'s local
+    block at staging row ``e * nodes_per_element + j``; this kernel writes
+    the matching ``(row, column, value)`` triplet for every entry, with the
+    triplet index equal to the flattened staging index so that
+    ``bsr_set_from_triplets`` receives one triplet per local-block entry.
+    Nodes outside the test (row) or trial (column) partitions are marked with
+    ``NULL_NODE_INDEX`` and ignored by the BSR construction, mirroring the
+    legacy bilinear kernels.
+
+    Args:
+        domain: Cell domain of the integration.
+        test: Test field (provides the row topology and partition).
+        trial: Trial field (provides the column topology and partition).
+        staging_dtype: Scalar type of the per-element staging array.
+        output_dtype: Scalar type of the triplet values array.
+    """
+    test_topology = test.space.topology
+    trial_topology = trial.space.topology
+    test_partition = test.space_partition
+    trial_partition = trial.space_partition
+
+    @cache.dynamic_kernel(
+        suffix=(
+            "sumfac_triplet_fill",
+            domain.name,
+            test.space.name,
+            test_partition.name,
+            trial.space.name,
+            trial_partition.name,
+            cache.pod_type_key(staging_dtype),
+            cache.pod_type_key(output_dtype),
+        ),
+        kernel_options={"enable_backward": False},
+    )
+    def sumfac_triplet_fill_kernel(
+        domain_arg: domain.ElementArg,
+        domain_index_arg: domain.ElementIndexArg,
+        test_topo_arg: test_topology.TopologyArg,
+        test_partition_arg: test_partition.PartitionArg,
+        trial_topo_arg: trial_topology.TopologyArg,
+        trial_partition_arg: trial_partition.PartitionArg,
+        nodes_per_element: int,
+        staging: wp.array2d(dtype=staging_dtype),
+        triplet_rows: wp.array(dtype=int),
+        triplet_cols: wp.array(dtype=int),
+        triplet_values: wp.array3d(dtype=output_dtype),
+    ):
+        domain_element_index, trial_node, test_node = wp.tid()
+        element_index = domain.element_index(domain_index_arg, domain_element_index)
+
+        staging_row = domain_element_index * nodes_per_element + trial_node
+        triplet_index = staging_row * nodes_per_element + test_node
+
+        test_node_index = test_topology.element_node_index(domain_arg, test_topo_arg, element_index, test_node)
+        row = test_partition.partition_node_index(test_partition_arg, test_node_index)
+        trial_node_index = trial_topology.element_node_index(domain_arg, trial_topo_arg, element_index, trial_node)
+        col = trial_partition.partition_node_index(trial_partition_arg, trial_node_index)
+        if row == NULL_NODE_INDEX or col == NULL_NODE_INDEX:
+            # Will get ignored when converting to BSR
+            row = NULL_NODE_INDEX
+            col = NULL_NODE_INDEX
+
+        triplet_rows[triplet_index] = row
+        triplet_cols[triplet_index] = col
+        triplet_values[triplet_index, 0, 0] = output_dtype(staging[staging_row, test_node])
+
+    return sumfac_triplet_fill_kernel
 
 
 def get_sumfac_scatter_kernel(

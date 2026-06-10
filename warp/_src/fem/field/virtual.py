@@ -416,12 +416,13 @@ class SeedField(AdjointField):
     ``B^T D B`` pipeline, see :mod:`warp._src.fem.sumfac.qfunction`).
 
     The seed selector is carried by the ``test_dof`` member of the
-    :class:`Sample`, decoded branchlessly with ``get_node_index_in_element``:
-    index ``0`` selects the value seed ``(v = 1, grad v = 0)`` and index
-    ``1 + i`` the gradient seed ``(v = 0, grad v = e_i)`` for spatial axis
-    ``i``. The injected gradient is expressed directly in the frame chosen by
-    the consumer (the Q-function extraction seeds *physical* unit vectors), so
-    no reference-gradient transform is applied here.
+    :class:`Sample` (``trial_dof`` for the :class:`TrialSeedField` sibling),
+    decoded branchlessly with ``get_node_index_in_element``: index ``0``
+    selects the value seed ``(v = 1, grad v = 0)`` and index ``1 + i`` the
+    gradient seed ``(v = 0, grad v = e_i)`` for spatial axis ``i``. The
+    injected gradient is expressed directly in the frame chosen by the
+    consumer (the Q-function extraction seeds *physical* unit vectors), so no
+    reference-gradient transform is applied here.
 
     This channel was chosen over carrying seed values in the ``EvalArg``
     because the consumer evaluates the integrand ``d + 1`` times per
@@ -463,7 +464,7 @@ class SeedField(AdjointField):
 
         @cache.dynamic_func(suffix=self.name)
         def eval_seed_inner(args: self.ElementEvalArg, s: self.SampleType):
-            seed_index = get_node_index_in_element(s.test_dof)
+            seed_index = get_node_index_in_element(self._get_dof(s))
             return wp.where(seed_index == 0, value_type(1.0), value_type(0.0))
 
         return eval_seed_inner
@@ -478,7 +479,7 @@ class SeedField(AdjointField):
 
         @cache.dynamic_func(suffix=self.name)
         def eval_seed_grad_inner(args: self.ElementEvalArg, s: self.SampleType):
-            seed_index = get_node_index_in_element(s.test_dof)
+            seed_index = get_node_index_in_element(self._get_dof(s))
             grad_seed = gradient_type()
             for i in range(GRAD_DIM):
                 grad_seed[i] = wp.where(seed_index == i + 1, value_type(1.0), value_type(0.0))
@@ -499,6 +500,22 @@ class SeedField(AdjointField):
 
     def _make_eval_div_outer(self):
         return None
+
+
+class TrialSeedField(SeedField):
+    """Trial-function sibling of :class:`SeedField`.
+
+    The seed selector is carried by the ``trial_dof`` member of the
+    :class:`Sample` instead of ``test_dof``, so that a bilinear integrand can
+    be seeded independently on its test and trial sides to extract the per-
+    quadrature-point coefficient channels of the assembled local matrix (the
+    ``D`` stage of the sum-factorized assembly, see
+    :mod:`warp._src.fem.sumfac.kernels`).
+    """
+
+    @wp.func
+    def _get_dof(s: Any):
+        return s.trial_dof
 
 
 class ValueInjectedField(AdjointField):

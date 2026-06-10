@@ -108,6 +108,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
     from warp.tests.fem.test_fem_quadrature import TestFemQuadrature
     from warp.tests.fem.test_fem_shape import TestFemShape
     from warp.tests.fem.test_fem_sumfac_apply import TestFemSumfacApply
+    from warp.tests.fem.test_fem_sumfac_assembly import TestFemSumfacAssembly
     from warp.tests.fem.test_fem_sumfac_polynomial import TestFemSumfacPolynomial
     from warp.tests.fem.test_fem_sumfac_qfunction import TestFemSumfacQFunction
     from warp.tests.geometry.test_bvh import TestBvh
@@ -314,6 +315,7 @@ def default_suite(test_loader: unittest.TestLoader = unittest.defaultTestLoader)
         TestFemQuadrature,
         TestFemShape,
         TestFemSumfacApply,
+        TestFemSumfacAssembly,
         TestFemSumfacContract,
         TestFemSumfacOperators,
         TestFemSumfacPolynomial,

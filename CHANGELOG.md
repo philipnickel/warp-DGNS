@@ -19,8 +19,9 @@
   sparse operations, `bsr_zeros(row_capacity=...)` for reserving row capacity, `bsr_compress()` for inplace compaction of sparse matrices, and sparse status constants for overflow checks ([GH-1537](https://github.com/NVIDIA/warp/issues/1537)).
 - `fem.integrate()` and `fem.interpolate()` can now leverage `sparse.bsr_compress()` to perform inplace matrix assembly, reducing peak memory usage ([GH-1537](https://github.com/NVIDIA/warp/issues/1537)).
 - `warp.fem`: Add a transparent sum-factorization path for high-order tensor-product discontinuous-Galerkin linear
-  forms in `fem.integrate()`. Qualifying forms are detected automatically; use `fem.set_sumfac_mode()` (`"auto"`,
-  `"force"`, or `"off"`) or the `WARP_FEM_SUMFAC` environment variable to override the dispatch for A/B testing.
+  and bilinear forms in `fem.integrate()`, covering both the matrix-free apply and the assembly of the sparse matrix.
+  Qualifying forms are detected automatically; use `fem.set_sumfac_mode()` (`"auto"`, `"force"`, or `"off"`) or the
+  `WARP_FEM_SUMFAC` environment variable to override the dispatch for A/B testing.
 
 ### Removed
 

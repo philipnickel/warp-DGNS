@@ -13,7 +13,15 @@ from warp._src.fem.space import (
 from .field import DiscreteField, FieldLike, GeometryField, ImplicitField, NonconformingField, SpaceField, UniformField
 from .nodal_field import NodalField
 from .restriction import FieldRestriction
-from .virtual import LocalTestField, LocalTrialField, SeedField, TestField, TrialField, ValueInjectedField
+from .virtual import (
+    LocalTestField,
+    LocalTrialField,
+    SeedField,
+    TestField,
+    TrialField,
+    TrialSeedField,
+    ValueInjectedField,
+)
 
 
 def make_restriction(

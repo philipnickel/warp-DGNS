@@ -164,14 +164,17 @@ def sumfac_applicable(
     Internal: operates on the parsed integrand arguments produced by
     :func:`integrate` and requires ``integrand.operators`` to be populated.
 
-    Requires a linear form (test field, no trial) over a cell domain with a
+    Requires a linear or bilinear form over a cell domain with a
     tensor-product geometry and a scalar, discontinuous, tensor-product
     polynomial test space, integrated with a matching tensor-product
-    :class:`RegularQuadrature`, accessing the test field only through value
-    and gradient operators, with a single injectable input field. In
-    ``"auto"`` mode the space degree must also reach
-    ``SUMFAC_DEGREE_THRESHOLD``. Anything unproven returns ``False``: the
-    caller falls through to the legacy kernels, which is always correct.
+    :class:`RegularQuadrature`, accessing the test (and trial) field only
+    through value and gradient operators. Linear forms additionally need a
+    single injectable input field; bilinear forms need the trial field to be
+    defined over the same function space as the test field (mixed test/trial
+    spaces fall back to the legacy kernels). In ``"auto"`` mode the space
+    degree must also reach ``SUMFAC_DEGREE_THRESHOLD``. Anything unproven
+    returns ``False``: the caller falls through to the legacy kernels, which
+    is always correct.
 
     Args:
         integrand: The form being integrated.
@@ -187,10 +190,12 @@ def sumfac_applicable(
         mode = get_sumfac_mode()
     if mode == "off":
         return False
-    if test is None or trial is not None:
+    if test is None:
         return False
-    # Plain test field only (excludes LocalTestField dispatched assembly views)
+    # Plain test/trial fields only (excludes Local*Field dispatched assembly views)
     if type(test) is not TestField:
+        return False
+    if trial is not None and type(trial) is not TrialField:
         return False
     if quadrature is None or domain is None or quadrature.domain != domain:
         return False
@@ -203,7 +208,9 @@ def sumfac_applicable(
 
     from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
 
-    return sumfac_kernels.find_sumfac_layout(integrand, arguments, test, quadrature, domain) is not None
+    if trial is None:
+        return sumfac_kernels.find_sumfac_layout(integrand, arguments, test, quadrature, domain) is not None
+    return sumfac_kernels.find_sumfac_bilinear_layout(integrand, arguments, test, trial, quadrature, domain) is not None
 
 
 def _any_field_requires_grad(field_args: dict[str, Any]) -> bool:
@@ -1293,33 +1300,50 @@ def _generate_integrate_kernel(
 
     if sumfac_plan is not None:
         # Sum-factorized fused B^T D B kernel. Must be handled before the generic
-        # branches: the SeedField/ValueInjectedField substitution (performed by
-        # make_sumfac_plan) changes the field structs and the transformed
-        # integrand, so the kernel suffix is recomputed from the substituted
-        # field names and tagged with a sum-factorization discriminator plus the
-        # baked tile sizes -- a cache-key collision with the legacy kernel would
-        # be a silent-correctness bug.
+        # branches: the seed/injected field substitution (performed by
+        # make_sumfac_plan / make_sumfac_bilinear_plan) changes the field structs
+        # and the transformed integrand, so the kernel suffix is recomputed from
+        # the substituted field names and tagged with a sum-factorization
+        # discriminator plus the baked tile sizes -- a cache-key collision with
+        # the legacy kernel would be a silent-correctness bug.
         from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
 
+        is_bilinear = isinstance(sumfac_plan, sumfac_kernels.SumfacBilinearPlan)
+
         field_names = tuple((k, f.name) for k, f in arguments.field_args.items())
-        kernel_suffix = (
-            "sumfac",
-            sumfac_plan.element_batch,
-            sumfac_plan.n,
-            sumfac_plan.q,
-            sumfac_plan.dim,
-            sumfac_plan.test_uses_grad,
-            # The kernel bakes the ORIGINAL input field's _read_node_value and
-            # EvalArg, but the substituted field names only carry the
-            # ValueInjectedField name: discriminate on the concrete class so a
-            # future NodalField subclass over the same space cannot silently
-            # reuse the base-class kernel.
-            type(sumfac_plan.input_field).__qualname__,
-            quadrature.name,
-            field_names,
-            cache.pod_type_key(output_dtype),
-            cache.pod_type_key(accumulate_dtype),
-        )
+        if is_bilinear:
+            kernel_suffix = (
+                "sumfac-bilinear",
+                sumfac_plan.element_batch,
+                sumfac_plan.n,
+                sumfac_plan.q,
+                sumfac_plan.dim,
+                sumfac_plan.test_uses_grad,
+                sumfac_plan.trial_uses_grad,
+                quadrature.name,
+                field_names,
+                cache.pod_type_key(output_dtype),
+                cache.pod_type_key(accumulate_dtype),
+            )
+        else:
+            kernel_suffix = (
+                "sumfac",
+                sumfac_plan.element_batch,
+                sumfac_plan.n,
+                sumfac_plan.q,
+                sumfac_plan.dim,
+                sumfac_plan.test_uses_grad,
+                # The kernel bakes the ORIGINAL input field's _read_node_value and
+                # EvalArg, but the substituted field names only carry the
+                # ValueInjectedField name: discriminate on the concrete class so a
+                # future NodalField subclass over the same space cannot silently
+                # reuse the base-class kernel.
+                type(sumfac_plan.input_field).__qualname__,
+                quadrature.name,
+                field_names,
+                cache.pod_type_key(output_dtype),
+                cache.pod_type_key(accumulate_dtype),
+            )
         # The staged kernel does not support autodiff yet; with backward enabled
         # every tile_matmul would build three GEMM LTOs, tripling compile time.
         sumfac_kernel_options = dict(kernel_options) if kernel_options else {}
@@ -1340,34 +1364,56 @@ def _generate_integrate_kernel(
                 integrand, arguments.field_args, sample_type=domain.geometry.sample_type
             )
 
-            integrate_kernel_fn = sumfac_kernels.get_integrate_linear_sumfac_kernel(
-                integrand_func,
-                domain,
-                quadrature,
-                FieldStruct,
-                ValueStruct,
-                test=test,
-                input_field=sumfac_plan.input_field,
-                injected_field=sumfac_plan.injected_field,
-                n=sumfac_plan.n,
-                q=sumfac_plan.q,
-                dim=sumfac_plan.dim,
-                element_batch=sumfac_plan.element_batch,
-                test_uses_grad=sumfac_plan.test_uses_grad,
-                accumulate_dtype=accumulate_dtype,
-            )
+            if is_bilinear:
+                integrate_kernel_fn = sumfac_kernels.get_integrate_bilinear_sumfac_kernel(
+                    integrand_func,
+                    domain,
+                    quadrature,
+                    FieldStruct,
+                    ValueStruct,
+                    test=test,
+                    trial=trial,
+                    n=sumfac_plan.n,
+                    q=sumfac_plan.q,
+                    dim=sumfac_plan.dim,
+                    element_batch=sumfac_plan.element_batch,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                    trial_uses_grad=sumfac_plan.trial_uses_grad,
+                    accumulate_dtype=accumulate_dtype,
+                )
+                # Both seed selectors travel through the Sample, so the kernel's
+                # `fields` argument is passed to the integrand unchanged.
+                code_transformers = [
+                    PassFieldArgsToIntegrand(
+                        arg_names=integrand.argspec.args,
+                        parsed_args=arguments,
+                        integrand_func=integrand_func,
+                    ),
+                ]
+            else:
+                integrate_kernel_fn = sumfac_kernels.get_integrate_linear_sumfac_kernel(
+                    integrand_func,
+                    domain,
+                    quadrature,
+                    FieldStruct,
+                    ValueStruct,
+                    test=test,
+                    input_field=sumfac_plan.input_field,
+                    injected_field=sumfac_plan.injected_field,
+                    n=sumfac_plan.n,
+                    q=sumfac_plan.q,
+                    dim=sumfac_plan.dim,
+                    element_batch=sumfac_plan.element_batch,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                    accumulate_dtype=accumulate_dtype,
+                )
 
-            copied_field_names = [
-                name
-                for name, field in arguments.field_args.items()
-                if isinstance(field, FieldLike) and name != sumfac_plan.input_name
-            ]
-            kernel, _FieldStruct, _ValueStruct = cache.get_integrand_kernel(
-                integrand=integrand,
-                kernel_fn=integrate_kernel_fn,
-                suffix=kernel_suffix,
-                kernel_options=sumfac_kernel_options,
-                code_transformers=[
+                copied_field_names = [
+                    name
+                    for name, field in arguments.field_args.items()
+                    if isinstance(field, FieldLike) and name != sumfac_plan.input_name
+                ]
+                code_transformers = [
                     sumfac_kernels.SumfacQPFieldsTransformer(
                         copied_field_names=copied_field_names,
                         injected_field_name=sumfac_plan.input_name,
@@ -1378,7 +1424,14 @@ def _generate_integrate_kernel(
                         integrand_func=integrand_func,
                         fields_var_name="qp_fields",
                     ),
-                ],
+                ]
+
+            kernel, _FieldStruct, _ValueStruct = cache.get_integrand_kernel(
+                integrand=integrand,
+                kernel_fn=integrate_kernel_fn,
+                suffix=kernel_suffix,
+                kernel_options=sumfac_kernel_options,
+                code_transformers=code_transformers,
                 FieldStruct=FieldStruct,
                 ValueStruct=ValueStruct,
             )
@@ -1904,6 +1957,9 @@ def _launch_integrate_kernel(
 
     if nodal:
         nnz = test.space_restriction.node_count()
+    elif sumfac_plan is not None:
+        # One triplet per entry of each element's dense local block
+        nnz = domain.element_count() * sumfac_plan.nodes_per_element**2
     else:
         nnz = test.space_restriction.total_node_element_count() * trial.space.topology.MAX_NODES_PER_ELEMENT
 
@@ -1998,7 +2054,68 @@ def _launch_integrate_kernel(
             device=device,
         )
 
-    if nodal:
+    if sumfac_plan is not None:
+        from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+
+        element_count = domain.element_count()
+        nodes_per_element = sumfac_plan.nodes_per_element
+
+        interp_arr, deriv_arr = sumfac_plan.operator_arrays(accumulate_dtype, device)
+
+        # Column j of element e's local block lands at staging row
+        # e * nodes_per_element + j (one tile_store per column).
+        staging = cache.borrow_temporary(
+            temporary_store,
+            shape=(element_count * nodes_per_element, nodes_per_element),
+            dtype=accumulate_dtype,
+            device=device,
+        )
+
+        wp.launch_tiled(
+            kernel,
+            dim=[element_count],
+            inputs=[
+                qp_arg,
+                domain_elt_arg,
+                domain_elt_index_arg,
+                field_arg_values,
+                value_struct_values,
+                interp_arr,
+                deriv_arr,
+                staging,
+            ],
+            block_dim=sumfac_kernels.sumfac_block_dim(device),
+            device=device,
+        )
+
+        fill_kernel = sumfac_kernels.get_sumfac_triplet_fill_kernel(
+            domain,
+            test,
+            trial,
+            staging_dtype=accumulate_dtype,
+            output_dtype=output_dtype,
+        )
+        wp.launch(
+            fill_kernel,
+            dim=(element_count, nodes_per_element, nodes_per_element),
+            inputs=[
+                domain_elt_arg,
+                domain_elt_index_arg,
+                test.space.topology.topo_arg_value(device),
+                test.space_partition.partition_arg_value(device),
+                trial.space.topology.topo_arg_value(device),
+                trial.space_partition.partition_arg_value(device),
+                nodes_per_element,
+                staging,
+                triplet_rows,
+                triplet_cols,
+                triplet_values,
+            ],
+            device=device,
+        )
+
+        staging.release()
+    elif nodal:
         wp.launch(
             kernel=kernel,
             dim=triplet_values.shape,
@@ -2291,7 +2408,12 @@ def integrate(
         ):
             from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
 
-            sumfac_plan = sumfac_kernels.make_sumfac_plan(integrand, arguments, test, quadrature, domain)
+            if trial is None:
+                sumfac_plan = sumfac_kernels.make_sumfac_plan(integrand, arguments, test, quadrature, domain)
+            else:
+                sumfac_plan = sumfac_kernels.make_sumfac_bilinear_plan(
+                    integrand, arguments, test, trial, quadrature, domain
+                )
 
     if assembly == "dispatch" and sumfac_plan is None:
         if test is not None:
