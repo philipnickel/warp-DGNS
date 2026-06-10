@@ -28,7 +28,7 @@ import warp as wp
 import warp._src.fem.integrate as fem_integrate
 import warp.fem as fem
 import warp.sparse as sparse
-from warp.fem.utils import grid_to_tris
+from warp.fem.utils import grid_to_quads, grid_to_tris
 from warp.tests.unittest_utils import *
 
 
@@ -274,6 +274,35 @@ def _gen_trimesh(nx, ny):
     return wp.array(positions, dtype=wp.vec2d), wp.array(vidx, dtype=int)
 
 
+def _gen_nonaffine_quadmesh(nx, ny, rng):
+    """Sheared quad mesh with perturbed interior vertices.
+
+    Every element gets a different, non-constant Jacobian with off-diagonal
+    entries, exercising the both-sides ``J^{-1}`` channel mapping of the
+    bilinear D stage that axis-aligned grids cannot reach.
+    """
+    x = np.linspace(0.0, 1.0, nx + 1)
+    y = np.linspace(0.0, 1.0, ny + 1)
+    grid = np.transpose(np.meshgrid(x, y, indexing="ij"), axes=(1, 2, 0)).reshape(-1, 2)
+    shear = np.array([[1.0, 0.35], [0.2, 1.1]])
+    positions = grid @ shear.T
+    interior = (grid[:, 0] > 0.0) & (grid[:, 0] < 1.0) & (grid[:, 1] > 0.0) & (grid[:, 1] < 1.0)
+    h = 1.0 / max(nx, ny)
+    positions[interior] += rng.uniform(-0.15 * h, 0.15 * h, size=(int(interior.sum()), 2))
+    vidx = grid_to_quads(nx, ny)
+    return wp.array(positions, dtype=wp.vec2d), wp.array(vidx, dtype=int)
+
+
+def test_assembled_equals_naive_nonaffine_quadmesh(test, device):
+    rng = np.random.default_rng(61)
+    with wp.ScopedDevice(device):
+        positions, quad_vidx = _gen_nonaffine_quadmesh(3, 2, rng)
+        geo = fem.Quadmesh2D(quad_vertex_indices=quad_vidx, positions=positions)
+        _check_assembly_matches_naive(test, mass_form, geo, 4)
+        _check_assembly_matches_naive(test, stiffness_form, geo, 4)
+        _check_assembly_matches_naive(test, advection_form_2d, geo, 4, values={"vel": wp.vec2d(0.7, -0.3)})
+
+
 devices = get_test_devices()
 
 
@@ -359,6 +388,12 @@ add_function_test(
     TestFemSumfacAssembly,
     "test_assembled_equals_naive_advection",
     test_assembled_equals_naive_advection,
+    devices=devices,
+)
+add_function_test(
+    TestFemSumfacAssembly,
+    "test_assembled_equals_naive_nonaffine_quadmesh",
+    test_assembled_equals_naive_nonaffine_quadmesh,
     devices=devices,
 )
 add_function_test(TestFemSumfacAssembly, "test_blockdiag_structure", test_blockdiag_structure, devices=devices)

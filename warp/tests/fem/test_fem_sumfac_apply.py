@@ -31,7 +31,7 @@ import warp._src.fem.integrate as fem_integrate
 import warp.fem as fem
 import warp.sparse as sparse
 from warp._src.fem.sumfac import make_sumfac_linear_operator
-from warp.fem.utils import grid_to_tris
+from warp.fem.utils import grid_to_quads, grid_to_tris
 from warp.optim.linear import cg
 from warp.tests.unittest_utils import *
 
@@ -240,6 +240,29 @@ def _gen_trimesh(nx, ny):
     positions = np.transpose(np.meshgrid(x, y, indexing="ij"), axes=(1, 2, 0)).reshape(-1, 2)
     vidx = grid_to_tris(nx, ny)
     return wp.array(positions, dtype=wp.vec2d), wp.array(vidx, dtype=int)
+
+
+def _gen_nonaffine_quadmesh(nx, ny, rng):
+    """Sheared quad mesh with perturbed interior vertices (per-element, non-constant Jacobians)."""
+    x = np.linspace(0.0, 1.0, nx + 1)
+    y = np.linspace(0.0, 1.0, ny + 1)
+    grid = np.transpose(np.meshgrid(x, y, indexing="ij"), axes=(1, 2, 0)).reshape(-1, 2)
+    shear = np.array([[1.0, 0.35], [0.2, 1.1]])
+    positions = grid @ shear.T
+    interior = (grid[:, 0] > 0.0) & (grid[:, 0] < 1.0) & (grid[:, 1] > 0.0) & (grid[:, 1] < 1.0)
+    h = 1.0 / max(nx, ny)
+    positions[interior] += rng.uniform(-0.15 * h, 0.15 * h, size=(int(interior.sum()), 2))
+    vidx = grid_to_quads(nx, ny)
+    return wp.array(positions, dtype=wp.vec2d), wp.array(vidx, dtype=int)
+
+
+def test_apply_equals_naive_nonaffine_quadmesh(test, device):
+    rng = np.random.default_rng(59)
+    with wp.ScopedDevice(device):
+        positions, quad_vidx = _gen_nonaffine_quadmesh(3, 2, rng)
+        geo = fem.Quadmesh2D(quad_vertex_indices=quad_vidx, positions=positions)
+        _check_apply_matches_naive(test, mass_form, geo, 4, rng)
+        _check_apply_matches_naive(test, stiffness_form, geo, 4, rng)
 
 
 def test_affine_form_matches_default(test, device):
@@ -455,6 +478,12 @@ add_function_test(
 )
 add_function_test(
     TestFemSumfacApply, "test_apply_equals_naive_advection", test_apply_equals_naive_advection, devices=devices
+)
+add_function_test(
+    TestFemSumfacApply,
+    "test_apply_equals_naive_nonaffine_quadmesh",
+    test_apply_equals_naive_nonaffine_quadmesh,
+    devices=devices,
 )
 add_function_test(
     TestFemSumfacApply, "test_assembly_arg_selects_sumfac", test_assembly_arg_selects_sumfac, devices=devices

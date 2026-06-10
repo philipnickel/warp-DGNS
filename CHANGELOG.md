@@ -22,7 +22,8 @@
   `fem.integrate(..., assembly="sumfac")` selects fused `BᵀDB` kernels for both the matrix-free apply of linear forms
   and the assembly of bilinear forms to a sparse matrix. Requires a cell domain over a tensor-product geometry, a
   scalar discontinuous tensor-product polynomial space, and a matching `RegularQuadrature`; forms that do not qualify
-  raise an error describing the unmet requirement.
+  raise an error describing the unmet requirement. The convection-diffusion DG example demonstrates the hybrid pattern
+  (sum-factorized volume terms, default-path DG flux terms) via a new `--sumfac` flag.
 
 ### Removed
 
