@@ -19,17 +19,28 @@
 
 ## Known open issues (from adversarial reviews, none blocking)
 
-- **Fused 2D linear apply kernel faults at n=5 on RTX 5090 / CUDA 13.0** (found 2026-06-10 by the new P=4 2D
-  coverage — this shape had never run on any GPU; the old sweeps used 2D n∈{2,4,6}). CUDA error 700 (illegal
-  memory access); `compute-sanitizer` shows an OOB global read in `read_node_value` (`nodal_field.py:79`,
-  called from the B-stage gather) at a block-uniform address equal to `dof_values[node_count]`, although the
-  generated source indexes correctly (verified). Reproduces for any q∈{4,5,6}, any block_dim, both `ptx` and
-  `cubin` output; n=4 and n=6 2D, n=5 3D, and the bilinear assembly kernel at the same shape are all fine, so
-  `test_apply_*_2d`/`test_affine_form_matches_default`/`test_assembly_apply_consistency` fail on this box
-  while everything else (incl. end-to-end DG P=4) passes. A minimal standalone tile kernel reproducing the
-  full gather → BᵀDB-matmul → element-loop skeleton does NOT trigger it (`/tmp/tile_gather_repro.py` pattern),
-  so the trigger involves the D-stage integrand/quadrature/geometry call chain. Not yet tested on
-  A100/CUDA 13.1 — do that first to separate "sm_120/13.0 toolchain bug" from "latent kernel bug".
+- **nvJitLink LTO miscompiles the fused 2D linear apply kernel at n=5 into an infinite loop** (found
+  2026-06-10 by the new P=4 2D coverage — this shape had never run on any GPU; the old sweeps used 2D
+  n∈{2,4,6}). Root cause established by reading the final linked PTX: the B-stage gather loop
+  (`for node in range(nn_c)`, kernels.py) is emitted with an **unconditional back-branch and no exit
+  condition**, and everything after it (matmuls, D-stage, BᵀT, store) is deleted as unreachable — the kernel
+  body truncates right after the loop. At runtime the loop walks `read_node_value` past the DOF array
+  (instrumentation showed `node` reaching 200+; the first OOB index is always `node_count`, which is what
+  `compute-sanitizer` reported) → CUDA error 700.
+  Localization: compiling the **identical generated source with NVRTC alone (no `-dlto`) produces a correct
+  loop** — the damage happens only in the LTO link step, where nvJitLink inlines the cuBLASDx
+  `dot_5_5_5_*` LTOIR and re-optimizes. Reproduced with nvJitLink/NVRTC **12.9.86, 13.0.88 (and the
+  `.alt` NVRTC build), and 13.3.33** (13.3 output inspected from the kernel cache; its PTX ISA 9.3 cannot
+  load on the 13.0 driver). Insensitive to `--Ofast-compile` levels, `--extra-device-vectorization`,
+  `--restrict`, block_dim 32/64, and `ptx` vs `cubin` output. Given the LTO dependence this is almost
+  certainly **not Blackwell-specific** and would reproduce on the A100 as well.
+  Shape envelope (runtime-verified): 2D linear n=5 broken for any q∈{4,5,6}; 2D n=4/n=6, 3D n=5, the
+  bilinear kernel at n=5, and the standalone contraction kernels using the same 5×5×5 GEMM are all fine. So
+  `test_apply_*_2d`/`test_affine_form_matches_default`/`test_assembly_apply_consistency` fail on CUDA while
+  everything else (incl. end-to-end DG P=4) passes. A nested-loop gather rewrite avoids it at runtime but was
+  rejected as a fix (perturbs the design to dodge a linker bug). Next steps: report to NVIDIA (artifact pair:
+  cached truncated `*.sm120.ptx` vs the correct NVRTC-only compile of the same cached `.cu`) and to
+  NVIDIA/warp; try a newer libmathdx (different LTOIR producer); re-test when a fixed nvJitLink ships.
 
 - Bilinear sumfac tests use axis-aligned grids only; a non-affine (Quadmesh2D) bilinear oracle test would catch off-diagonal-Jacobian errors in the both-sides J⁻¹ channel mapping (the *apply* path does have a non-affine check).
 - `E_b > 1` is implemented only in the standalone contraction primitives, not the fused kernels (bench says E_b=1 is optimal at P≥4 anyway; E_b≈4 would help near the crossover).
