@@ -324,8 +324,8 @@ def _find_tensor_product_core(
     """
     if domain.element_kind != ElementKind.CELL:
         raise SumfacNotApplicableError(
-            "assembly='sumfac' is only supported over cell domains; "
-            "side (DG face) integrals must use the default assembly"
+            "this sum-factorized volume path requires a cell domain; linear side (DG face) forms are handled by "
+            "warp._src.fem.sumfac.side_kernels and bilinear side forms must use the default assembly"
         )
     geometry = domain.geometry
     dim = geometry.dimension

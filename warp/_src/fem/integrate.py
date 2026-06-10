@@ -120,7 +120,15 @@ def _field_requiring_grad(field_args: dict[str, Any]) -> str | None:
         try:
             dof_values = getattr(field, "dof_values", None)
         except NotImplementedError:
-            return name
+            # Trace fields do not expose dof_values directly; introspect the
+            # underlying cell field instead.
+            cell_field = getattr(field, "cell_field", None)
+            if cell_field is None or cell_field is field:
+                return name
+            try:
+                dof_values = getattr(cell_field, "dof_values", None)
+            except NotImplementedError:
+                return name
         if is_array(dof_values) and dof_values.requires_grad:
             return name
     return None
@@ -137,12 +145,12 @@ def _validate_sumfac_request(domain, test, trial, quadrature, output, kernel_opt
     from warp._src.fem.sumfac.kernels import SumfacNotApplicableError  # noqa: PLC0415 (circular import)
 
     # Checked here (rather than only in the layout finders) so that side
-    # integrals get the meaningful error even when their trace fields cannot
-    # be introspected by the differentiability check below.
-    if domain.element_kind != ElementKind.CELL:
+    # bilinear forms get the meaningful error before any field introspection.
+    if domain.element_kind != ElementKind.CELL and trial is not None:
         raise SumfacNotApplicableError(
-            "assembly='sumfac' is only supported over cell domains; "
-            "side (DG face) integrals must use the default assembly"
+            "assembly='sumfac' does not support bilinear forms over side (DG face) domains; only linear side "
+            "forms (matrix-free face applies) are sum-factorized -- assemble side matrices with the default "
+            "assembly"
         )
     if test is None:
         raise SumfacNotApplicableError("assembly='sumfac' requires a linear or bilinear form with a test field")
@@ -1259,11 +1267,29 @@ def _generate_integrate_kernel(
         # discriminator plus the baked tile sizes -- a cache-key collision with
         # the legacy kernel would be a silent-correctness bug.
         from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+        from warp._src.fem.sumfac import side_kernels as sumfac_side_kernels  # noqa: PLC0415 (circular import)
 
         is_bilinear = isinstance(sumfac_plan, sumfac_kernels.SumfacBilinearPlan)
+        is_side = isinstance(sumfac_plan, sumfac_side_kernels.SumfacSidePlan)
 
         field_names = tuple((k, f.name) for k, f in arguments.field_args.items())
-        if is_bilinear:
+        if is_side:
+            kernel_suffix = (
+                "sumfac-side",
+                sumfac_plan.n,
+                sumfac_plan.q,
+                sumfac_plan.dim,
+                sumfac_plan.test_uses_grad,
+                # The kernel bakes the ORIGINAL cell field's EvalArg for the
+                # trace gather; discriminate on the concrete class so a future
+                # NodalField subclass cannot silently reuse the base kernel.
+                type(sumfac_plan.cell_field).__qualname__,
+                quadrature.name,
+                field_names,
+                cache.pod_type_key(output_dtype),
+                cache.pod_type_key(accumulate_dtype),
+            )
+        elif is_bilinear:
             kernel_suffix = (
                 "sumfac-bilinear",
                 sumfac_plan.element_batch,
@@ -1316,7 +1342,41 @@ def _generate_integrate_kernel(
                 integrand, arguments.field_args, sample_type=domain.geometry.sample_type
             )
 
-            if is_bilinear:
+            if is_side:
+                integrate_kernel_fn = sumfac_side_kernels.get_integrate_side_sumfac_kernel(
+                    integrand_func,
+                    domain,
+                    quadrature,
+                    FieldStruct,
+                    ValueStruct,
+                    test=test,
+                    cell_field=sumfac_plan.cell_field,
+                    injected_field=sumfac_plan.injected_field,
+                    n=sumfac_plan.n,
+                    q=sumfac_plan.q,
+                    dim=sumfac_plan.dim,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                    accumulate_dtype=accumulate_dtype,
+                )
+
+                copied_field_names = [
+                    name
+                    for name, field in arguments.field_args.items()
+                    if isinstance(field, FieldLike) and name != sumfac_plan.input_name
+                ]
+                code_transformers = [
+                    sumfac_kernels.SumfacQPFieldsTransformer(
+                        copied_field_names=copied_field_names,
+                        injected_field_name=sumfac_plan.input_name,
+                    ),
+                    PassFieldArgsToIntegrand(
+                        arg_names=integrand.argspec.args,
+                        parsed_args=arguments,
+                        integrand_func=integrand_func,
+                        fields_var_name="qp_fields",
+                    ),
+                ]
+            elif is_bilinear:
                 integrate_kernel_fn = sumfac_kernels.get_integrate_bilinear_sumfac_kernel(
                     integrand_func,
                     domain,
@@ -1760,7 +1820,77 @@ def _launch_integrate_kernel(
             )
         )
 
+        is_side_sumfac = False
         if sumfac_plan is not None:
+            from warp._src.fem.sumfac import side_kernels as sumfac_side_kernels  # noqa: PLC0415 (circular import)
+
+            is_side_sumfac = isinstance(sumfac_plan, sumfac_side_kernels.SumfacSidePlan)
+
+        if is_side_sumfac:
+            from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+
+            nodes_per_element = sumfac_plan.nodes_per_element
+
+            end_ops_arr, tang_ops_arr = sumfac_plan.operator_arrays(accumulate_dtype, device)
+            input_eval_arg = sumfac_plan.cell_field.EvalArg()
+            sumfac_plan.cell_field.fill_eval_arg(input_eval_arg, device)
+
+            face_map, active_cells = sumfac_side_kernels.get_side_gather_arrays(
+                domain, device, temporary_store=temporary_store
+            )
+            active_cell_count = active_cells.shape[0]
+
+            staging = cache.borrow_temporary(
+                temporary_store,
+                shape=(active_cell_count, nodes_per_element),
+                dtype=accumulate_dtype,
+                device=device,
+            )
+
+            if active_cell_count > 0:
+                wp.launch_tiled(
+                    kernel,
+                    dim=[active_cell_count],
+                    inputs=[
+                        qp_arg,
+                        domain_elt_arg,
+                        domain_elt_index_arg,
+                        field_arg_values,
+                        value_struct_values,
+                        input_eval_arg,
+                        end_ops_arr,
+                        tang_ops_arr,
+                        face_map,
+                        active_cells,
+                        staging,
+                    ],
+                    block_dim=sumfac_kernels.sumfac_block_dim(device),
+                    device=device,
+                )
+
+                scatter_kernel = sumfac_side_kernels.get_sumfac_side_scatter_kernel(
+                    domain.geometry,
+                    test.space,
+                    test.space_partition,
+                    staging_dtype=accumulate_dtype,
+                    output_dtype=type_scalar_type(output_dtype),
+                )
+                wp.launch(
+                    scatter_kernel,
+                    dim=(active_cell_count, nodes_per_element),
+                    inputs=[
+                        domain.geometry.cell_arg_value(device),
+                        test.space.topology.full_space_topology().topo_arg_value(device),
+                        test.space_partition.partition_arg_value(device),
+                        active_cells,
+                        staging,
+                        output_view,
+                    ],
+                    device=device,
+                )
+
+            staging.release()
+        elif sumfac_plan is not None:
             from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
 
             element_count = domain.element_count()
@@ -2271,7 +2401,7 @@ def integrate(
             - "nodal": For linear or bilinear forms, use the test function nodes as the quadrature points. Assumes Lagrange interpolation functions are used, and no differential or DG operator is evaluated on the test or trial functions.
             - "generic": Single-pass integration and shape-function evaluation. Makes no assumption about the integrand's content, but may lead to many redundant computations.
             - "dispatch": For linear or bilinear forms, first evaluate the form at quadrature points then dispatch to nodes in a second pass. More efficient for integrands that are expensive to evaluate. Incompatible with `at_node` and `node_index` operators on test or trial functions.
-            - "sumfac": Opt-in sum-factorized (fused ``B^T D B``) integration for high-order tensor-product discontinuous-Galerkin forms, covering both the matrix-free apply of linear forms and the assembly of bilinear forms. Requires a cell domain over a 2D/3D tensor-product geometry, a scalar discontinuous tensor-product polynomial space (the same space for test and trial fields), a matching tensor-product :class:`RegularQuadrature`, and value/gradient operators only on the test and trial fields. Does not support differentiation (backward kernels, differentiable inputs or outputs). Never selected automatically; forms that do not qualify raise a ``NotImplementedError`` describing the first unmet requirement.
+            - "sumfac": Opt-in sum-factorized (fused ``B^T D B``) integration for high-order tensor-product discontinuous-Galerkin forms, covering the matrix-free apply of linear forms (over cell domains and, with sum-factorized face traces, over ``Grid2D``/``Grid3D`` side domains) and the assembly of bilinear forms over cell domains. Requires a 2D/3D tensor-product geometry, a scalar discontinuous tensor-product polynomial space (the same space for test, trial, and input fields), a matching tensor-product :class:`RegularQuadrature`, and value/gradient operators only on the test, trial, and input fields (side forms additionally support the jump/average trace combinations, which expand to those operators). Does not support differentiation (backward kernels, differentiable inputs or outputs) or bilinear side forms. Never selected automatically; forms that do not qualify raise a ``NotImplementedError`` describing the first unmet requirement.
             - `None` (default): Automatically picks a suitable assembly strategy (either "generic" or "dispatch")
         add: If True and `output` is provided, add the integration result to `output` instead of replacing its content
         bsr_options: Additional options to be passed to the sparse matrix construction algorithm.
@@ -2352,11 +2482,14 @@ def integrate(
         # autodiff support, so differentiation requests are rejected up front.
         if assembly == "sumfac":
             from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+            from warp._src.fem.sumfac import side_kernels as sumfac_side_kernels  # noqa: PLC0415 (circular import)
 
             _validate_sumfac_request(
                 domain, test, trial, quadrature, output, kernel_options, accumulate_dtype, arguments.field_args
             )
-            if trial is None:
+            if domain.element_kind == ElementKind.SIDE:
+                sumfac_plan = sumfac_side_kernels.make_sumfac_side_plan(integrand, arguments, test, quadrature, domain)
+            elif trial is None:
                 sumfac_plan = sumfac_kernels.make_sumfac_plan(integrand, arguments, test, quadrature, domain)
             else:
                 sumfac_plan = sumfac_kernels.make_sumfac_bilinear_plan(

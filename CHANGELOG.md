@@ -23,7 +23,10 @@
   and the assembly of bilinear forms to a sparse matrix. Requires a cell domain over a tensor-product geometry, a
   scalar discontinuous tensor-product polynomial space, and a matching `RegularQuadrature`; forms that do not qualify
   raise an error describing the unmet requirement. The convection-diffusion DG example demonstrates the hybrid pattern
-  (sum-factorized volume terms, default-path DG flux terms) via a new `--sumfac` flag.
+  (sum-factorized volume terms, default-path DG flux terms) via a new `--sumfac` flag. Linear side (DG face) forms over
+  `fem.Sides`/`fem.BoundarySides` (or side subdomains) of `Grid2D`/`Grid3D` geometries are also supported with
+  sum-factorized face traces, enabling fully matrix-free DG operators (e.g. SIPG diffusion: sum-factorized volume apply
+  plus sum-factorized interior-penalty flux apply); bilinear side forms keep using the default assembly.
 
 ### Removed
 

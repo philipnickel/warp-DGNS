@@ -17,6 +17,8 @@ from .virtual import (
     LocalTestField,
     LocalTrialField,
     SeedField,
+    SideSeedField,
+    SideTraceInjectedField,
     TestField,
     TrialField,
     TrialSeedField,

@@ -404,12 +404,14 @@ class TestFemSumfacApply(unittest.TestCase):
             kwargs.setdefault("output_dtype", wp.float64)
             return fem.integrate(form, fields=fields, assembly="sumfac", **kwargs)
 
-        # Side (boundary) domain: faces are not supported by the cell-only sum-factorized path
+        # Bilinear side forms are not supported by the sum-factorized path
+        # (linear side forms are -- see test_fem_sumfac_faces.py)
         sides = fem.BoundarySides(geo)
         side_test = fem.make_test(space=space, domain=sides)
+        side_trial = fem.make_trial(space=space, domain=sides)
         side_quadrature = fem.RegularQuadrature(sides, order=4)
-        with self.assertRaisesRegex(NotImplementedError, "cell domains"):
-            integrate_sumfac(mass_form, {"u": u.trace(), "v": side_test}, quadrature=side_quadrature)
+        with self.assertRaisesRegex(NotImplementedError, "bilinear forms over side"):
+            integrate_sumfac(mass_form, {"u": side_trial, "v": side_test}, quadrature=side_quadrature)
 
         # Simplex geometry: triangle shape functions are not tensor products
         positions, tri_vidx = _gen_trimesh(3, 2)
