@@ -14,12 +14,20 @@
 | 5 · Face fallback + end-to-end DG | **DONE** (reworked to assembly-arg form at P=4 — see consolidation row) | `43a048e2`; `test_fem_sumfac_faces.py` |
 | Bench (A100) | **DONE** | `7e59cbf8`; `design/sumfac-bench-results.md` — crossover P=3, 14× at P=5 → ~62× at P=7–8, 920 GF/s f64, FP64 DMMA confirmed via PTX; `warp/examples/fem/bench_sumfac_dg.py` |
 | C · API consolidation (`assembly="sumfac"`) | **DONE** (CUDA-validated, one known issue below) | Replace the transparent auto/force/off dispatch with an explicit `integrate(..., assembly="sumfac")` opt-in (never auto-selected); unqualified forms raise `SumfacNotApplicableError` naming the unmet requirement, including the bilinear smem-budget gate. `set_sumfac_mode`/`get_sumfac_mode`/`WARP_FEM_SUMFAC`/`SUMFAC_DEGREE_THRESHOLD` removed; `make_sumfac_linear_operator` now calls `assembly="sumfac"`. GPU correctness tests collapsed to P=4 (contract tests keep one E_b>1 and one rectangular q≠n case). Also: shared layout/plan dataclass bases; tensor_contract test-only residual drivers moved into the contract tests; verified (against generated source) that in-loop `wp.static` guards do NOT force-unroll the flat D-stage loops — closure booleans are replaced at declaration time, so the loops compile dynamic as intended. CUDA-revalidated on RTX 5090 (sm_120, CUDA 13.0 via pixi toolkit): operators/polynomial/contract/qfunction/faces/assembly suites green incl. the end-to-end DG P=4 solve and all E_b>1 tile kernels; the 2D *linear apply* shape n=5 hits the known issue below. |
+| T · Tile-native linear kernels | **DONE** | Rewrite the fused linear apply kernels to the tile-native formulation (`design/sumfac-tile-native-operator.md`): B-stage gather = one `tile_load` (elements as tile space; requires `WholeSpacePartition`, enforced in `find_sumfac_layout`); 2D uses the stacked `[A; D̂]` operator (all channels from 2 GEMMs, Bᵀ in 2 GEMMs); 3D keeps its GEMM slab structure with the tile-load gather. Removes the nvJitLink trigger by construction; validated by the isolated spike (`design/spike_tile_native_gemm/`) and the full P=4 suites on CPU+CUDA. Follow-up (spec R6): dimension-generic mode-k emitter unifying 2D/3D/faces; tile-native bilinear assembly. |
 | 6 · Surface sum-factorization | **NEXT — not started** | Spec for stage 1 (face traces + ordering locks): `design/sumfac-phase6-stage1-spec.md`. Stage 2 = tile kernels + dispatch relaxation; stage 3 = fully-sumfac DG e2e. Plan section "Phase 6" in `sumfac-dg-implementation-plan.md`; risk §9.8 (inner/outer face orientation) MUST be locked by the stage-1 ordering test before any flux kernel. |
 | 7 · High-order example adoption | **TODO** | Plan section "Phase 7"; `example_convection_diffusion_dg.py` already has `--degree`. AOT prewarm (`wp.compile_aot_module`) is a candidate deliverable. |
 
 ## Known open issues (from adversarial reviews, none blocking)
 
-- **nvJitLink LTO miscompiles the fused 2D linear apply kernel at n=5 into an infinite loop** (found
+- **[RESOLVED on the kernel side by the tile-native rewrite]** The fused linear kernels no longer contain the
+  scalar-gather structure that nvJitLink miscompiled: the B-stage gather is now a single `tile_load` (mesh
+  elements as the tile space; layout guaranteed by a `WholeSpacePartition` check in the layout predicate),
+  and the 2D kernel uses the stacked `[A; D̂]` operator pipeline (4 GEMMs total) per
+  `design/sumfac-tile-native-operator.md`. All sumfac suites pass on the RTX 5090 (CPU + CUDA, including the
+  formerly failing n=5 2D linear apply cases). The nvJitLink miscompilation itself remains unfixed upstream —
+  the artifact pair and the record below stay valid for the NVIDIA/Warp reports.
+- **nvJitLink LTO miscompiles the (former) scalar-gather 2D linear apply kernel at n=5 into an infinite loop** (found
   2026-06-10 by the new P=4 2D coverage — this shape had never run on any GPU; the old sweeps used 2D
   n∈{2,4,6}). Root cause established by reading the final linked PTX: the B-stage gather loop
   (`for node in range(nn_c)`, kernels.py) is emitted with an **unconditional back-branch and no exit

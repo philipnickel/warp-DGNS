@@ -6,11 +6,14 @@
 This module provides the staged kernel factory behind the explicit
 ``integrate(..., assembly="sumfac")`` opt-in in :mod:`warp._src.fem.integrate`:
 
-1. **B stage** -- the input field's element DOFs are gathered in-kernel and
-   interpolated to the quadrature points (value and reference gradient) with
-   per-axis :func:`warp.tile_matmul` contractions against the 1D interpolation
-   and derivative operators, following the canonical layouts of
-   :mod:`warp._src.fem.sumfac.tensor_contract`.
+1. **B stage** -- mesh elements form the tile space: the layout predicate
+   guarantees element-major contiguous DOFs (regular DG topology over the
+   whole space partition), so the input field's element DOFs load as a single
+   :func:`warp.tile_load` and are interpolated to the quadrature points
+   (value and reference gradient) with :func:`warp.tile_matmul` contractions.
+   In 2D the interpolation and derivative operators are stacked into one
+   ``(2q, n)`` operator tile, so all channels emerge from two GEMMs (see
+   ``design/sumfac-tile-native-operator.md``).
 2. **D stage** -- per quadrature point, the *transformed user integrand* is
    evaluated ``d + 1`` times with the test field replaced by a
    :class:`warp._src.fem.field.SeedField` (value/gradient seeds carried by
@@ -60,6 +63,7 @@ from warp._src.fem.polynomial import quadrature_1d
 from warp._src.fem.quadrature import Quadrature, RegularQuadrature
 from warp._src.fem.space import FunctionSpace, SpacePartition
 from warp._src.fem.space.basis_space import ShapeBasisSpace
+from warp._src.fem.space.partition import WholeSpacePartition
 from warp._src.fem.space.shape.cube_shape_function import CubeTripolynomialShapeFunctions
 from warp._src.fem.space.shape.square_shape_function import SquareBipolynomialShapeFunctions
 from warp._src.fem.space.topology import RegularDiscontinuousSpaceTopologyMixin
@@ -370,8 +374,10 @@ def find_sumfac_layout(
     space = test.space
 
     # Exactly one injectable input field: a nodal field over the same space as
-    # the test field, accessed only through value/gradient operators. Other
-    # field arguments are evaluated through their standard machinery.
+    # the test field, on the whole space partition (so its DOF storage is
+    # element-major contiguous and the B-stage gather is a single tile load),
+    # accessed only through value/gradient operators. Other field arguments
+    # are evaluated through their standard machinery.
     input_name = None
     input_field = None
     rejected = []
@@ -380,6 +386,12 @@ def find_sumfac_layout(
             continue
         if field.space.name != space.name:
             rejected.append(f"'{name}' is defined over space '{field.space.name}', not the test space")
+            continue
+        if not isinstance(field.space_partition, WholeSpacePartition):
+            rejected.append(
+                f"'{name}' is defined over a partial space partition "
+                f"({type(field.space_partition).__name__}); the tile-space gather requires the whole space"
+            )
             continue
         field_operators = integrand.operators.get(name, set())
         unsupported = field_operators - _SUPPORTED_INPUT_OPERATORS
@@ -786,26 +798,24 @@ def get_integrate_linear_sumfac_kernel(
     value_type = injected_field.dtype
     grad_type = injected_field.gradient_dtype
     InjectedEvalArg = injected_field.EvalArg
-    InputElementEvalArg = input_field.ElementEvalArg
-    read_node_value = input_field._read_node_value
 
-    # The per-quadrature-point and gather loops are written as single flat
-    # loops with index arithmetic so that Warp does not unroll them (their
-    # trip counts exceed the unroll limit): a fully unrolled D stage inlines
-    # hundreds of seeded integrand evaluations and makes the generated source
+    # The per-quadrature-point loop is written as a single flat loop with
+    # index arithmetic so that Warp does not unroll it (its trip count
+    # exceeds the unroll limit): a fully unrolled D stage inlines hundreds of
+    # seeded integrand evaluations and makes the generated source
     # pathologically large for NVRTC at high degrees. The wp.static() guards
-    # inside the loop bodies do not defeat this: closure booleans are
+    # inside the loop body do not defeat this: closure booleans are
     # evaluated and replaced by constants at declaration time
-    # (replace_static_expressions in warp/_src/codegen.py), so the loops
-    # never reach get_unroll_range's force-unroll path, which only fires for
-    # static expressions that cannot be resolved early. Verified against the
-    # generated source: the D-stage loops compile to dynamic loops.
+    # (replace_static_expressions in warp/_src/codegen.py), so the loop
+    # never reaches get_unroll_range's force-unroll path, which only fires
+    # for static expressions that cannot be resolved early.
     n_c = wp.constant(n)
     q_c = wp.constant(q)
     nn_c = wp.constant(n * n)
     qq_c = wp.constant(q * q)
 
     if dim == 2:
+        q2_c = wp.constant(2 * q)
 
         def integrate_kernel_fn(
             qp_arg: quadrature.Arg,
@@ -821,33 +831,28 @@ def get_integrate_linear_sumfac_kernel(
             domain_element_index = wp.tid()
             element_index = domain.element_index(domain_index_arg, domain_element_index)
 
+            # Stacked operator [A; D_hat]: one (2q, n) tile drives every stage
             a_tile = wp.tile_load(interp, shape=(q_c, n_c))
             d_tile = wp.tile_load(deriv, shape=(q_c, n_c))
-            a_t = wp.tile_transpose(a_tile)
-            d_t = wp.tile_transpose(d_tile)
+            op = wp.tile_zeros(shape=(q2_c, n_c), dtype=accumulate_dtype)
+            wp.tile_assign(op, a_tile, offset=(0, 0))
+            wp.tile_assign(op, d_tile, offset=(q_c, 0))
+            op_t = wp.tile_transpose(op)
 
-            # --- B stage: gather element DOFs and interpolate to quadrature points
-            input_args = InputElementEvalArg(domain_arg, input_eval_arg)
-            u_mat = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)
-            for node in range(nn_c):
-                i = node // n_c
-                j = node - i * n_c
-                u_mat[i, j] = accumulate_dtype(read_node_value(input_args, element_index, node))
+            # --- B stage: elements are the tile space -- the layout predicate
+            # guarantees element-major contiguous DOFs over the whole space
+            # partition, so the gather is a single cooperative tile load.
+            u_flat = wp.tile_load(input_eval_arg.dof_values, shape=(nn_c,), offset=(element_index * nn_c,))
+            u_mat = wp.tile_astype(wp.tile_reshape(u_flat, shape=(n_c, n_c)), dtype=accumulate_dtype)
 
-            stage_i = wp.tile_matmul(a_tile, u_mat)  # (q, n) [qx, j]
-            stage_d = wp.tile_matmul(d_tile, u_mat)
-            uq = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
-            wp.tile_matmul(stage_i, a_t, uq)  # value [qx, qy]
-            g_xi = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
-            wp.tile_matmul(stage_d, a_t, g_xi)  # d/dxi
-            g_eta = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
-            wp.tile_matmul(stage_i, d_t, g_eta)  # d/deta
+            # All channels in one (2q, 2q) tile: values in s[0:q, 0:q],
+            # d/dxi in s[q:, 0:q], d/deta in s[0:q, q:] (plus a cross block).
+            t = wp.tile_matmul(op, u_mat)  # (2q, n)
+            s = wp.tile_matmul(t, op_t)  # (2q, 2q)
 
-            # --- D stage: seeded integrand evaluations per quadrature point
-            f0 = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
-            if wp.static(test_uses_grad):
-                f1_xi = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
-                f1_eta = wp.tile_zeros(shape=(q_c, q_c), dtype=accumulate_dtype)
+            # --- D stage: seeded integrand evaluations per quadrature point,
+            # reading/writing the channel blocks of the stacked tiles
+            f = wp.tile_zeros(shape=(q2_c, q2_c), dtype=accumulate_dtype)
 
             qp_fields = FieldStruct()
             _copy_qp_fields()
@@ -867,17 +872,17 @@ def get_integrate_linear_sumfac_kernel(
 
                 # Inject the B-stage interpolated value and physical gradient
                 inj_arg = InjectedEvalArg()
-                inj_arg.value = value_type(uq[qx, qy])
-                g_ref = grad_type(value_type(g_xi[qx, qy]), value_type(g_eta[qx, qy]))
+                inj_arg.value = value_type(s[qx, qy])
+                g_ref = grad_type(value_type(s[q_c + qx, qy]), value_type(s[qx, q_c + qy]))
                 inj_arg.gradient = wp.transpose(jac_inv) * g_ref
                 _set_injected_eval_arg()
 
-                # Value seed (v = 1, grad v = 0) -> f0
+                # Value seed (v = 1, grad v = 0) -> f0 block
                 sample = SampleType(element_index, qp_coords, qp_index, qp_weight, DofIndex(0, 0), NULL_DOF_INDEX)
-                f0[qx, qy] = scale * accumulate_dtype(integrand_func(sample, qp_fields, values))
+                f[qx, qy] = scale * accumulate_dtype(integrand_func(sample, qp_fields, values))
 
-                # Gradient seeds (v = 0, grad v = e_i) -> f1; the seeds are
-                # physical, so map back to reference space with J^{-1}.
+                # Gradient seeds (v = 0, grad v = e_i) -> f1 blocks; the seeds
+                # are physical, so map back to reference space with J^{-1}.
                 if wp.static(test_uses_grad):
                     f1_phys = grad_type()
                     for seed in range(2):
@@ -886,19 +891,14 @@ def get_integrate_linear_sumfac_kernel(
                         )
                         f1_phys[seed] = value_type(integrand_func(sample, qp_fields, values))
                     f1_ref = jac_inv * f1_phys
-                    f1_xi[qx, qy] = scale * accumulate_dtype(f1_ref[0])
-                    f1_eta[qx, qy] = scale * accumulate_dtype(f1_ref[1])
+                    f[q_c + qx, qy] = scale * accumulate_dtype(f1_ref[0])
+                    f[qx, q_c + qy] = scale * accumulate_dtype(f1_ref[1])
 
-            # --- B^T stage: contract (f0, f1) back to nodal residuals
-            # r = Kron(I, I)^T f0 + Kron(D, I)^T f1_xi + Kron(I, D)^T f1_eta
-            r = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)
-            tmp0 = wp.tile_matmul(a_t, f0)  # (n, q)
-            wp.tile_matmul(tmp0, a_tile, r)
-            if wp.static(test_uses_grad):
-                tmp1 = wp.tile_matmul(d_t, f1_xi)
-                wp.tile_matmul(tmp1, a_tile, r)
-                tmp2 = wp.tile_matmul(a_t, f1_eta)
-                wp.tile_matmul(tmp2, d_tile, r)
+            # --- B^T stage: the block algebra of op^T @ f @ op collapses to
+            # A^T f0 A + D^T f1_xi A + A^T f1_eta D (the zero cross block of f
+            # annihilates the D^T . D term).
+            r1 = wp.tile_matmul(op_t, f)  # (n, 2q)
+            r = wp.tile_matmul(r1, op)  # (n, n)
 
             r_flat = wp.tile_reshape(r, shape=(1, nn_c))
             wp.tile_store(result_elem, r_flat, offset=(domain_element_index, 0))
@@ -927,13 +927,11 @@ def get_integrate_linear_sumfac_kernel(
         a_t = wp.tile_transpose(a_tile)
         d_t = wp.tile_transpose(d_tile)
 
-        # --- B stage: gather element DOFs and interpolate to quadrature points
-        input_args = InputElementEvalArg(domain_arg, input_eval_arg)
-        u_mat = wp.tile_zeros(shape=(n_c, nn_c), dtype=accumulate_dtype)  # [i, j*n + k]
-        for node in range(nnn_c):
-            i = node // nn_c
-            jk = node - i * nn_c
-            u_mat[i, jk] = accumulate_dtype(read_node_value(input_args, element_index, node))
+        # --- B stage: elements are the tile space -- the layout predicate
+        # guarantees element-major contiguous DOFs over the whole space
+        # partition, so the gather is a single cooperative tile load.
+        u_flat = wp.tile_load(input_eval_arg.dof_values, shape=(nnn_c,), offset=(element_index * nnn_c,))
+        u_mat = wp.tile_astype(wp.tile_reshape(u_flat, shape=(n_c, nn_c)), dtype=accumulate_dtype)  # [i, j*n + k]
 
         stage_i = wp.tile_matmul(a_tile, u_mat)  # (q, n^2) [qx, j*n + k]
         stage_d = wp.tile_matmul(d_tile, u_mat)
