@@ -3,8 +3,8 @@
 
 """Fused sum-factorized ``B^T D B`` apply kernels for linear forms (Phase 3).
 
-This module provides the staged kernel factory behind the transparent
-sum-factorization dispatch in :mod:`warp._src.fem.integrate`:
+This module provides the staged kernel factory behind the explicit
+``integrate(..., assembly="sumfac")`` opt-in in :mod:`warp._src.fem.integrate`:
 
 1. **B stage** -- the input field's element DOFs are gathered in-kernel and
    interpolated to the quadrature points (value and reference gradient) with
@@ -32,13 +32,14 @@ The kernel is generated through the standard ``cache.get_integrand_kernel`` +
 every backward-enabled ``tile_matmul`` would triple the LTO compile cost).
 
 Structural applicability is decided host-side by :func:`find_sumfac_layout`,
-which conservatively verifies every assumption baked into the kernel: cell
-domain, tensor-product discontinuous scalar space, lexicographically ordered
+which verifies every assumption baked into the kernel: cell domain,
+tensor-product discontinuous scalar space, lexicographically ordered
 tensor-product ``RegularQuadrature`` points, supported operators on the test
-field, and a single injectable input field. As with the rest of the
-``B^T D B`` machinery, the integrand must be *linear* in the test function
-(weak forms are, by construction; affine offsets cannot be represented by the
-seeded extraction).
+field, and a single injectable input field. Forms that do not qualify are
+rejected with a :class:`SumfacNotApplicableError` naming the unmet
+requirement. As with the rest of the ``B^T D B`` machinery, the integrand
+must be *linear* in the test function (weak forms are, by construction;
+affine offsets cannot be represented by the seeded extraction).
 """
 
 import ast
@@ -76,6 +77,7 @@ from warp._src.types import type_scalar_type
 
 __all__ = [
     "SumfacBilinearPlan",
+    "SumfacNotApplicableError",
     "SumfacPlan",
     "find_sumfac_bilinear_layout",
     "find_sumfac_layout",
@@ -88,6 +90,15 @@ __all__ = [
     "make_sumfac_plan",
     "sumfac_block_dim",
 ]
+
+
+class SumfacNotApplicableError(NotImplementedError):
+    """Raised when ``integrate(..., assembly="sumfac")`` requests the sum-factorized path for a form that does not meet its requirements.
+
+    The message names the first unmet requirement; forms that do not qualify
+    must be integrated with one of the default assembly strategies instead.
+    """
+
 
 #: Panel width (elements per block). Only ``1`` is implemented for now; the
 #: ``E_b > 1`` wider-GEMM variant is a Phase 5 performance knob.
@@ -206,53 +217,90 @@ def _get_operator_arrays(interp: np.ndarray, deriv: np.ndarray, dtype, device):
     return arrays
 
 
-def _tensor_product_quadrature_points_1d(quadrature: RegularQuadrature, dim: int) -> np.ndarray | None:
-    """Extract the 1D point set if the quadrature is a lexicographic tensor product, else ``None``.
+def _tensor_product_quadrature_points_1d(quadrature: RegularQuadrature, dim: int) -> np.ndarray:
+    """Extract the 1D point set of a lexicographic tensor-product quadrature.
 
     The fused kernel assumes the per-element quadrature points enumerate the
     outer product of a single 1D rule with the first axis slowest (matching
     the lexicographic node ordering of the square/cube shape functions); this
     is verified explicitly rather than assumed (silent-correctness risk).
+    Raises :class:`SumfacNotApplicableError` otherwise.
     """
+
+    def tensor_product_error():
+        return SumfacNotApplicableError(
+            "assembly='sumfac' requires the quadrature points to form the lexicographic tensor product "
+            f"of a single 1D rule along each axis; the {count} points per element of this RegularQuadrature do not"
+        )
+
     count = quadrature.max_points_per_element()
     if count is None or count < 1:
-        return None
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' requires a quadrature rule with a fixed, nonzero number of points per element"
+        )
     q = round(count ** (1.0 / dim))
     while q**dim < count:
         q += 1
     if q < 1 or q**dim != count:
-        return None
+        raise tensor_product_error()
 
     points = np.array([[p[i] for i in range(dim)] for p in quadrature.points], dtype=np.float64)
     # With the first axis slowest, the last coordinate of the first q points is the 1D rule
     qpoints_1d = points[:q, dim - 1].copy()
     if len(np.unique(qpoints_1d)) != q:
-        return None
+        raise tensor_product_error()
 
     grids = np.meshgrid(*([qpoints_1d] * dim), indexing="ij")
     expected = np.stack([g.reshape(-1) for g in grids], axis=-1)
     atol = 1e-5 if quadrature.domain.geometry.scalar_type == wp.float32 else 1e-12
     if not np.allclose(points, expected, rtol=0.0, atol=atol):
-        return None
+        raise tensor_product_error()
     return qpoints_1d
 
 
-def _is_tensor_product_scalar_dg_space(space: FunctionSpace, dim: int) -> bool:
-    """Check that ``space`` is a scalar, discontinuous, tensor-product polynomial space."""
+def _check_tensor_product_scalar_dg_space(space: FunctionSpace, dim: int):
+    """Check that ``space`` is a scalar, discontinuous, tensor-product polynomial space.
+
+    Raises :class:`SumfacNotApplicableError` naming the first unmet requirement.
+    """
     if space.NODE_DOF_COUNT != 1 or space.VALUE_DOF_COUNT != 1:
-        return False
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' requires a scalar function space; space '{space.name}' has "
+            f"{space.NODE_DOF_COUNT} DOF(s) per node and {space.VALUE_DOF_COUNT} value DOF(s) (1 and 1 required)"
+        )
     if not isinstance(space.topology, RegularDiscontinuousSpaceTopologyMixin):
-        return False
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' requires a discontinuous (DG) space over a regular tensor-product grid; "
+            f"space '{space.name}' uses {type(space.topology).__name__}"
+        )
     basis = space.basis
-    if not isinstance(basis, ShapeBasisSpace):
-        return False
     shape_cls = SquareBipolynomialShapeFunctions if dim == 2 else CubeTripolynomialShapeFunctions
-    if type(basis.shape) is not shape_cls:
-        return False
+    if not isinstance(basis, ShapeBasisSpace) or type(basis.shape) is not shape_cls:
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' requires square/cube tensor-product polynomial shape functions; "
+            f"space '{space.name}' uses {type(basis.shape).__name__ if isinstance(basis, ShapeBasisSpace) else type(basis).__name__}"
+        )
     degree = space.degree
-    if degree < 1:
-        return False
-    return space.topology.MAX_NODES_PER_ELEMENT == (degree + 1) ** dim
+    if degree < 1 or space.topology.MAX_NODES_PER_ELEMENT != (degree + 1) ** dim:
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' requires a complete tensor-product polynomial basis of degree >= 1; "
+            f"space '{space.name}' has degree {degree} and {space.topology.MAX_NODES_PER_ELEMENT} nodes per element"
+        )
+
+
+def _check_seedable_operators(integrand, field_name: str, supported: frozenset, context: str) -> set:
+    """Return the operators applied to ``field_name``, raising if any cannot be seeded."""
+    if integrand.operators is None:
+        raise RuntimeError("Integrand operators must be resolved before the sum-factorization layout is built")
+    operators = integrand.operators.get(field_name, set())
+    unsupported = operators - supported
+    if unsupported:
+        op_names = ", ".join(sorted(op.name for op in unsupported))
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' does not support operator(s) [{op_names}] on the {context} '{field_name}'; "
+            "only value and gradient evaluation (inner, outer, grad, grad_outer, degree) can be seeded"
+        )
+    return operators
 
 
 def _find_tensor_product_core(
@@ -261,35 +309,38 @@ def _find_tensor_product_core(
     test: TestField,
     quadrature: Quadrature,
     domain: GeometryDomain,
-) -> tuple[int, np.ndarray, set] | None:
+) -> tuple[int, np.ndarray, set]:
     """Verify the geometric/space/quadrature/operator assumptions shared by the apply and assembly paths.
 
     Returns ``(dim, qpoints_1d, test_operators)`` for a cell domain over a
     tensor-product geometry with a scalar discontinuous tensor-product test
     space, a matching lexicographic tensor-product :class:`RegularQuadrature`,
-    and only seedable operators on the test field, else ``None``.
+    and only seedable operators on the test field. Raises
+    :class:`SumfacNotApplicableError` naming the first unmet requirement.
     """
     if domain.element_kind != ElementKind.CELL:
-        return None
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' is only supported over cell domains; "
+            "side (DG face) integrals must use the default assembly"
+        )
     geometry = domain.geometry
     dim = geometry.dimension
     if dim not in (2, 3) or geometry.cell_dimension != dim:
-        return None
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' requires a 2D or 3D tensor-product geometry; got {type(geometry).__name__} "
+            f"with dimension {dim} and cell dimension {geometry.cell_dimension}"
+        )
 
-    if not _is_tensor_product_scalar_dg_space(test.space, dim):
-        return None
+    _check_tensor_product_scalar_dg_space(test.space, dim)
 
     if not isinstance(quadrature, RegularQuadrature) or quadrature.domain != domain:
-        return None
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' requires a RegularQuadrature defined over the integration domain; "
+            f"got {type(quadrature).__name__}"
+        )
     qpoints_1d = _tensor_product_quadrature_points_1d(quadrature, dim)
-    if qpoints_1d is None:
-        return None
 
-    if integrand.operators is None:
-        return None
-    test_operators = integrand.operators.get(arguments.test_name, set())
-    if not test_operators <= _SUPPORTED_TEST_OPERATORS:
-        return None
+    test_operators = _check_seedable_operators(integrand, arguments.test_name, _SUPPORTED_TEST_OPERATORS, "test field")
 
     return dim, qpoints_1d, test_operators
 
@@ -300,12 +351,12 @@ def find_sumfac_layout(
     test: TestField,
     quadrature: Quadrature,
     domain: GeometryDomain,
-) -> SumfacLayout | None:
-    """Return the sum-factorization layout if the form qualifies, else ``None``.
+) -> SumfacLayout:
+    """Return the sum-factorization layout of a qualifying linear form.
 
-    Conservative predicate core: every structural assumption of the fused
-    kernel is verified, and anything unproven returns ``None`` (the caller
-    falls through to the legacy kernels, which is always correct).
+    Every structural assumption of the fused kernel is verified; anything
+    unproven raises :class:`SumfacNotApplicableError` naming the first unmet
+    requirement.
 
     Args:
         integrand: The form being integrated; ``integrand.operators`` must
@@ -315,10 +366,7 @@ def find_sumfac_layout(
         quadrature: Quadrature formula of the integration.
         domain: Integration domain.
     """
-    core = _find_tensor_product_core(integrand, arguments, test, quadrature, domain)
-    if core is None:
-        return None
-    dim, qpoints_1d, test_operators = core
+    dim, qpoints_1d, test_operators = _find_tensor_product_core(integrand, arguments, test, quadrature, domain)
     space = test.space
 
     # Exactly one injectable input field: a nodal field over the same space as
@@ -326,19 +374,28 @@ def find_sumfac_layout(
     # field arguments are evaluated through their standard machinery.
     input_name = None
     input_field = None
+    rejected = []
     for name, field in arguments.field_args.items():
         if name == arguments.test_name or not isinstance(field, NodalField):
             continue
         if field.space.name != space.name:
+            rejected.append(f"'{name}' is defined over space '{field.space.name}', not the test space")
             continue
         field_operators = integrand.operators.get(name, set())
-        if not field_operators <= _SUPPORTED_INPUT_OPERATORS:
+        unsupported = field_operators - _SUPPORTED_INPUT_OPERATORS
+        if unsupported:
+            op_names = ", ".join(sorted(op.name for op in unsupported))
+            rejected.append(f"'{name}' is accessed through unsupported operator(s) [{op_names}]")
             continue
         input_name = name
         input_field = field
         break
     if input_name is None:
-        return None
+        detail = "; ".join(rejected) if rejected else "no discrete nodal field argument found"
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' requires an input field defined over the same space as the test field "
+            f"'{arguments.test_name}' and accessed only through value/gradient operators: {detail}"
+        )
 
     degree = space.degree
     return SumfacLayout(
@@ -373,18 +430,17 @@ def make_sumfac_plan(
     quadrature: Quadrature,
     domain: GeometryDomain,
     element_batch: int = SUMFAC_ELEMENT_BATCH,
-) -> SumfacPlan | None:
+) -> SumfacPlan:
     """Build the launch plan and substitute the seed/injected fields in ``arguments``.
 
     On success, ``arguments.field_args`` is mutated in place: the test field
     is replaced by a :class:`SeedField` and the input field by a
     :class:`ValueInjectedField`, so that the downstream ``FieldStruct`` /
     ``IntegrandTransformer`` machinery generates the in-kernel Q-function.
-    Returns ``None`` if the form does not qualify (no mutation happens).
+    Raises :class:`SumfacNotApplicableError` if the form does not qualify
+    (the layout is validated before any mutation of ``arguments``).
     """
     layout = find_sumfac_layout(integrand, arguments, test, quadrature, domain)
-    if layout is None:
-        return None
 
     interp, deriv = _build_1d_operator_matrices(test, layout)
 
@@ -429,9 +485,9 @@ def make_sumfac_plan(
 # the naive O(n^{2d} q^d).
 
 #: Conservative shared-memory budget (bytes) for the fused bilinear kernel's
-#: tile working set. Shapes whose estimated footprint exceeds it do not
-#: qualify (the caller falls back to the legacy kernels) instead of failing
-#: at module load; the A100-class opt-in limit is ~163 KiB and the estimate
+#: tile working set. Shapes whose estimated footprint exceeds it are rejected
+#: with a descriptive :class:`SumfacNotApplicableError` instead of failing at
+#: module load; the A100-class opt-in limit is ~163 KiB and the estimate
 #: deliberately keeps a wide margin for codegen temporaries.
 SUMFAC_BILINEAR_SMEM_BUDGET = 96 * 1024
 
@@ -485,8 +541,8 @@ def find_sumfac_bilinear_layout(
     trial: TrialField,
     quadrature: Quadrature,
     domain: GeometryDomain,
-) -> SumfacBilinearLayout | None:
-    """Return the sum-factorization layout for a bilinear form if it qualifies, else ``None``.
+) -> SumfacBilinearLayout:
+    """Return the sum-factorization layout of a qualifying bilinear form.
 
     In addition to the structural requirements of :func:`find_sumfac_layout`'s
     core (cell domain, tensor-product discontinuous scalar test space,
@@ -494,7 +550,8 @@ def find_sumfac_bilinear_layout(
     over the *same* function space as the test field (mixed test/trial spaces
     are rejected) and accessed only through value/gradient operators, and the
     fused kernel's estimated tile working set must fit the shared-memory
-    budget.
+    budget. Raises :class:`SumfacNotApplicableError` naming the first unmet
+    requirement.
 
     Args:
         integrand: The form being integrated; ``integrand.operators`` must
@@ -505,27 +562,33 @@ def find_sumfac_bilinear_layout(
         quadrature: Quadrature formula of the integration.
         domain: Integration domain.
     """
-    core = _find_tensor_product_core(integrand, arguments, test, quadrature, domain)
-    if core is None:
-        return None
-    dim, qpoints_1d, test_operators = core
+    dim, qpoints_1d, test_operators = _find_tensor_product_core(integrand, arguments, test, quadrature, domain)
     space = test.space
 
     # Same scalar space on both sides; the column node indexing and the
     # shared 1D operators both assume it.
     if trial.space.name != space.name:
-        return None
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' requires the trial field to be defined over the same function space as the "
+            f"test field; got '{trial.space.name}' vs '{space.name}'"
+        )
 
-    trial_operators = integrand.operators.get(arguments.trial_name, set())
-    if not trial_operators <= _SUPPORTED_TEST_OPERATORS:
-        return None
+    trial_operators = _check_seedable_operators(
+        integrand, arguments.trial_name, _SUPPORTED_TEST_OPERATORS, "trial field"
+    )
 
     degree = space.degree
     n = degree + 1
     q = len(qpoints_1d)
     scalar_bytes = 4 if type_scalar_type(space.dtype) == wp.float32 else 8
-    if _sumfac_bilinear_smem_estimate(n, q, dim, scalar_bytes) > SUMFAC_BILINEAR_SMEM_BUDGET:
-        return None
+    estimate = _sumfac_bilinear_smem_estimate(n, q, dim, scalar_bytes)
+    if estimate > SUMFAC_BILINEAR_SMEM_BUDGET:
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' bilinear assembly at degree {degree} ({dim}D, n={n}, q={q}, "
+            f"{'float32' if scalar_bytes == 4 else 'float64'}) has an estimated tile working set of "
+            f"{estimate / 1024:.0f} KiB, exceeding the {SUMFAC_BILINEAR_SMEM_BUDGET // 1024} KiB "
+            "shared-memory budget; use the default assembly for this form"
+        )
 
     return SumfacBilinearLayout(
         degree=degree,
@@ -546,19 +609,17 @@ def make_sumfac_bilinear_plan(
     quadrature: Quadrature,
     domain: GeometryDomain,
     element_batch: int = SUMFAC_ELEMENT_BATCH,
-) -> SumfacBilinearPlan | None:
+) -> SumfacBilinearPlan:
     """Build the assembly launch plan and substitute the seed fields in ``arguments``.
 
     On success, ``arguments.field_args`` is mutated in place: the test field
     is replaced by a :class:`SeedField` and the trial field by a
     :class:`TrialSeedField`, so that the downstream ``FieldStruct`` /
     ``IntegrandTransformer`` machinery generates the in-kernel channel
-    extraction. Returns ``None`` if the form does not qualify (no mutation
-    happens).
+    extraction. Raises :class:`SumfacNotApplicableError` if the form does not
+    qualify (the layout is validated before any mutation of ``arguments``).
     """
     layout = find_sumfac_bilinear_layout(integrand, arguments, test, trial, quadrature, domain)
-    if layout is None:
-        return None
 
     interp, deriv = _build_1d_operator_matrices(test, layout)
 
@@ -1521,12 +1582,11 @@ def make_sumfac_linear_operator(
     can be passed directly to the :mod:`warp.optim.linear` iterative solvers
     (pass ``use_cuda_graph=False``, as each apply allocates temporaries).
 
-    Each apply runs ``integrate()`` with the sum-factorization mode forced on
-    for that call only (the global mode set through
-    ``warp.fem.set_sumfac_mode`` is not touched); if the form does not
-    structurally qualify, the apply transparently (and correctly) falls back
-    to the legacy kernels. During an apply the input field's ``dof_values``
-    are temporarily rebound to ``x`` and restored afterwards.
+    Each apply runs ``integrate()`` with ``assembly="sumfac"``; if the form
+    does not meet the sum-factorization requirements, the first apply raises
+    :class:`SumfacNotApplicableError` describing the unmet requirement.
+    During an apply the input field's ``dof_values`` are temporarily rebound
+    to ``x`` and restored afterwards.
 
     Args:
         integrand: Linear form to apply, decorated with :func:`warp.fem.integrand`.
@@ -1567,11 +1627,8 @@ def make_sumfac_linear_operator(
     result = wp.empty(node_count, dtype=scalar_type, device=device)
 
     def matvec(x: wp.array, y: wp.array, z: wp.array, alpha, beta):
-        # Force sum-factorization for this call only (via the private
-        # integrate() argument): mutating the process-global mode here would
-        # leak into fem.integrate() calls running concurrently on other
-        # threads. The input field's DOFs are rebound to the solver iterate
-        # for the duration of the apply and restored afterwards.
+        # The input field's DOFs are rebound to the solver iterate for the
+        # duration of the apply and restored afterwards.
         previous_dof_values = input_field.dof_values
         input_field.dof_values = x
         try:
@@ -1583,7 +1640,7 @@ def make_sumfac_linear_operator(
                 output=result,
                 device=device,
                 temporary_store=temporary_store,
-                _sumfac_mode="force",
+                assembly="sumfac",
             )
         finally:
             input_field.dof_values = previous_dof_values

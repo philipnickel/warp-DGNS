@@ -3,7 +3,6 @@
 
 import ast
 import inspect
-import os
 import textwrap
 from collections.abc import Callable
 from typing import Any, NamedTuple
@@ -44,6 +43,7 @@ from warp._src.fem.types import (
     OUTSIDE,
     DofIndex,
     Domain,
+    ElementKind,
     Field,
     Sample,
     make_free_sample,
@@ -54,7 +54,7 @@ from warp._src.types import is_array, type_length, type_repr, type_scalar_type, 
 from warp._src.utils import array_cast, array_scan
 from warp.sparse import BsrMatrix, bsr_axpy, bsr_compress, bsr_set_from_triplets, bsr_set_zero, bsr_zeros
 
-__all__ = ["get_sumfac_mode", "integrate", "interpolate", "set_sumfac_mode"]
+__all__ = ["integrate", "interpolate"]
 
 _wp_module_name_ = "warp.fem.integrate"
 
@@ -110,124 +110,76 @@ def _require_bsr_capacity(bsr: BsrMatrix, nnz: int, operation: str):
         )
 
 
-_SUMFAC_MODES = ("auto", "force", "off")
-
-#: Minimum polynomial degree for which the sum-factorized path is selected in
-#: "auto" mode; below it the legacy kernels are typically faster. Module-level
-#: so it can be overridden for experiments.
-SUMFAC_DEGREE_THRESHOLD = 4
-
-
-def _initial_sumfac_mode() -> str:
-    mode = os.environ.get("WARP_FEM_SUMFAC", "auto").strip().lower()
-    return mode if mode in _SUMFAC_MODES else "auto"
-
-
-_sumfac_mode: str = _initial_sumfac_mode()
-
-
-def set_sumfac_mode(mode: str):
-    """Set the sum-factorization dispatch mode for :func:`integrate`.
-
-    Args:
-        mode: One of ``"auto"`` (select the sum-factorized kernels whenever
-            the form structurally qualifies and the polynomial degree is at
-            least ``SUMFAC_DEGREE_THRESHOLD``), ``"force"`` (select them
-            whenever structurally possible, bypassing the degree threshold),
-            or ``"off"`` (always use the legacy kernels).
-
-    The initial mode may also be set through the ``WARP_FEM_SUMFAC``
-    environment variable.
-    """
-    global _sumfac_mode
-    if mode not in _SUMFAC_MODES:
-        raise ValueError(f"Invalid sum-factorization mode '{mode}', expected one of {_SUMFAC_MODES}")
-    _sumfac_mode = mode
-
-
-def get_sumfac_mode() -> str:
-    """Return the current sum-factorization dispatch mode (see :func:`set_sumfac_mode`)."""
-    return _sumfac_mode
-
-
-def sumfac_applicable(
-    integrand: "Integrand",
-    arguments: "IntegrandArguments",
-    test: "TestField | None",
-    trial: "TrialField | None",
-    quadrature: Quadrature | None,
-    domain: GeometryDomain | None,
-    mode: str | None = None,
-) -> bool:
-    """Conservative predicate deciding whether the sum-factorized path may be used.
-
-    Internal: operates on the parsed integrand arguments produced by
-    :func:`integrate` and requires ``integrand.operators`` to be populated.
-
-    Requires a linear or bilinear form over a cell domain with a
-    tensor-product geometry and a scalar, discontinuous, tensor-product
-    polynomial test space, integrated with a matching tensor-product
-    :class:`RegularQuadrature`, accessing the test (and trial) field only
-    through value and gradient operators. Linear forms additionally need a
-    single injectable input field; bilinear forms need the trial field to be
-    defined over the same function space as the test field (mixed test/trial
-    spaces fall back to the legacy kernels). In ``"auto"`` mode the space
-    degree must also reach ``SUMFAC_DEGREE_THRESHOLD``. Anything unproven
-    returns ``False``: the caller falls through to the legacy kernels, which
-    is always correct.
-
-    Args:
-        integrand: The form being integrated.
-        arguments: Parsed integrand arguments (before field substitution).
-        test: Test field of the form, if any.
-        trial: Trial field of the form, if any.
-        quadrature: Quadrature formula of the integration.
-        domain: Integration domain.
-        mode: Sum-factorization mode to evaluate against; defaults to the
-            current global mode (see :func:`set_sumfac_mode`).
-    """
-    if mode is None:
-        mode = get_sumfac_mode()
-    if mode == "off":
-        return False
-    if test is None:
-        return False
-    # Plain test/trial fields only (excludes Local*Field dispatched assembly views)
-    if type(test) is not TestField:
-        return False
-    if trial is not None and type(trial) is not TrialField:
-        return False
-    if quadrature is None or domain is None or quadrature.domain != domain:
-        return False
-    if not isinstance(quadrature, RegularQuadrature):
-        return False
-    if mode != "force" and test.space.degree < SUMFAC_DEGREE_THRESHOLD:
-        return False
-
-    _find_integrand_operators(integrand, arguments.field_args)
-
-    from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
-
-    if trial is None:
-        return sumfac_kernels.find_sumfac_layout(integrand, arguments, test, quadrature, domain) is not None
-    return sumfac_kernels.find_sumfac_bilinear_layout(integrand, arguments, test, trial, quadrature, domain) is not None
-
-
-def _any_field_requires_grad(field_args: dict[str, Any]) -> bool:
-    """Return whether any field argument carries differentiable degrees of freedom.
+def _field_requiring_grad(field_args: dict[str, Any]) -> str | None:
+    """Return the name of the first field argument carrying differentiable degrees of freedom, if any.
 
     Conservative: a field whose degrees of freedom cannot be introspected is
-    treated as differentiable (the caller falls back to the legacy kernels,
-    which support autodiff).
+    treated as differentiable.
     """
-    for field in field_args.values():
+    for name, field in field_args.items():
         try:
             dof_values = getattr(field, "dof_values", None)
         except NotImplementedError:
-            return True
+            return name
         if is_array(dof_values) and dof_values.requires_grad:
-            return True
-    return False
+            return name
+    return None
+
+
+def _validate_sumfac_request(domain, test, trial, quadrature, output, kernel_options, accumulate_dtype, field_args):
+    """Check the :func:`integrate`-level preconditions of ``assembly="sumfac"``.
+
+    Raises :class:`warp._src.fem.sumfac.SumfacNotApplicableError` naming the
+    first unmet requirement. The remaining structural requirements (geometry,
+    space, quadrature point layout, operators) are checked by the
+    sum-factorization layout finders.
+    """
+    from warp._src.fem.sumfac.kernels import SumfacNotApplicableError  # noqa: PLC0415 (circular import)
+
+    # Checked here (rather than only in the layout finders) so that side
+    # integrals get the meaningful error even when their trace fields cannot
+    # be introspected by the differentiability check below.
+    if domain.element_kind != ElementKind.CELL:
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' is only supported over cell domains; "
+            "side (DG face) integrals must use the default assembly"
+        )
+    if test is None:
+        raise SumfacNotApplicableError("assembly='sumfac' requires a linear or bilinear form with a test field")
+    if type(test) is not TestField:
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' requires a plain test field created by fem.make_test(); got {type(test).__name__}"
+        )
+    if trial is not None and type(trial) is not TrialField:
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' requires a plain trial field created by fem.make_trial(); got {type(trial).__name__}"
+        )
+    if not isinstance(quadrature, RegularQuadrature):
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' requires a RegularQuadrature over the integration domain; "
+            f"got {type(quadrature).__name__}"
+        )
+    if type_to_warp(accumulate_dtype) not in (wp.float32, wp.float64):
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' only supports float32 or float64 accumulation; "
+            f"got accumulate_dtype={type_repr(accumulate_dtype)}"
+        )
+    if (kernel_options or {}).get("enable_backward", False):
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' does not support backward-mode differentiation "
+            "(kernel_options['enable_backward'] is True); use the default assembly instead"
+        )
+    if output is not None and getattr(output, "requires_grad", False):
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' does not support differentiable outputs (output.requires_grad is True); "
+            "use the default assembly instead"
+        )
+    grad_field = _field_requiring_grad(field_args)
+    if grad_field is not None:
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' does not support differentiable field inputs; field '{grad_field}' has "
+            "dof_values.requires_grad=True (or its degrees of freedom cannot be introspected)"
+        )
 
 
 def _resolve_path(func, node):
@@ -2268,8 +2220,8 @@ _NODE_OPERATORS = {
 
 def _pick_assembly_strategy(assembly: str | None, operators: dict[str, set[Operator]], arguments: IntegrandArguments):
     if assembly is not None:
-        if assembly not in ("generic", "nodal", "dispatch"):
-            raise ValueError(f"Invalid assembly strategy'{assembly}'")
+        if assembly not in ("generic", "nodal", "dispatch", "sumfac"):
+            raise ValueError(f"Invalid assembly strategy '{assembly}'")
         return assembly
 
     test_operators = operators.get(arguments.test_name, set())
@@ -2295,7 +2247,6 @@ def integrate(
     assembly: str | None = None,
     add: bool = False,
     bsr_options: dict[str, Any] | None = None,
-    _sumfac_mode: str | None = None,
 ):
     """
     Integrates a constant, linear or bilinear form, and returns a scalar, array, or sparse matrix, respectively.
@@ -2316,6 +2267,7 @@ def integrate(
             - "nodal": For linear or bilinear forms, use the test function nodes as the quadrature points. Assumes Lagrange interpolation functions are used, and no differential or DG operator is evaluated on the test or trial functions.
             - "generic": Single-pass integration and shape-function evaluation. Makes no assumption about the integrand's content, but may lead to many redundant computations.
             - "dispatch": For linear or bilinear forms, first evaluate the form at quadrature points then dispatch to nodes in a second pass. More efficient for integrands that are expensive to evaluate. Incompatible with `at_node` and `node_index` operators on test or trial functions.
+            - "sumfac": Opt-in sum-factorized (fused ``B^T D B``) integration for high-order tensor-product discontinuous-Galerkin forms, covering both the matrix-free apply of linear forms and the assembly of bilinear forms. Requires a cell domain over a 2D/3D tensor-product geometry, a scalar discontinuous tensor-product polynomial space (the same space for test and trial fields), a matching tensor-product :class:`RegularQuadrature`, and value/gradient operators only on the test and trial fields. Does not support differentiation (backward kernels, differentiable inputs or outputs). Never selected automatically; forms that do not qualify raise a ``NotImplementedError`` describing the first unmet requirement.
             - `None` (default): Automatically picks a suitable assembly strategy (either "generic" or "dispatch")
         add: If True and `output` is provided, add the integration result to `output` instead of replacing its content
         bsr_options: Additional options to be passed to the sparse matrix construction algorithm.
@@ -2388,26 +2340,18 @@ def integrate(
         elif domain != quadrature.domain:
             raise ValueError("Incompatible integration and quadrature domain")
 
-        # Transparent sum-factorization dispatch: when the form qualifies, keep
-        # the plain test field (no LocalTestField wrapping) and substitute the
-        # seed/injected fields so the fused B^T D B kernel can be generated.
-        # Only the "dispatch" strategy may be replaced: its seeded extraction
-        # semantics match the sum-factorized kernel, whereas "generic" is the
-        # documented escape hatch making no assumption about the integrand's
-        # content (e.g. forms that are not linear in the test function), so an
-        # explicit assembly="generic" request must be honored verbatim.
-        # The staged kernel has no autodiff support yet, so gradient requests
-        # fall through to the legacy kernels.
-        if (
-            assembly == "dispatch"
-            and (output is None or not getattr(output, "requires_grad", False))
-            and not (kernel_options or {}).get("enable_backward", False)
-            and type_to_warp(accumulate_dtype) in (wp.float32, wp.float64)
-            and sumfac_applicable(integrand, arguments, test, trial, quadrature, domain, mode=_sumfac_mode)
-            and not _any_field_requires_grad(arguments.field_args)
-        ):
+        # Explicit sum-factorization opt-in: the form must qualify, otherwise
+        # a descriptive error is raised (no silent fallback). The plain test
+        # and trial fields are kept (no LocalTestField wrapping); the plan
+        # substitutes the seed/injected fields in arguments.field_args so the
+        # fused B^T D B kernel can be generated. The staged kernel has no
+        # autodiff support, so differentiation requests are rejected up front.
+        if assembly == "sumfac":
             from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
 
+            _validate_sumfac_request(
+                domain, test, trial, quadrature, output, kernel_options, accumulate_dtype, arguments.field_args
+            )
             if trial is None:
                 sumfac_plan = sumfac_kernels.make_sumfac_plan(integrand, arguments, test, quadrature, domain)
             else:
@@ -2415,7 +2359,7 @@ def integrate(
                     integrand, arguments, test, trial, quadrature, domain
                 )
 
-    if assembly == "dispatch" and sumfac_plan is None:
+    if assembly == "dispatch":
         if test is not None:
             test = LocalTestField(test)
             arguments.field_args[arguments.test_name] = test

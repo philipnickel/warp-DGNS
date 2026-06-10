@@ -3,24 +3,22 @@
 
 """Tests for the fused sum-factorized ``B^T D B`` apply path (Phase 3).
 
-The transparent sum-factorization path replaces the standard linear-form
-integration kernel with a fused tile kernel (``B`` interpolation stage,
-seeded in-kernel Q-function ``D`` stage, ``B^T`` contraction stage) when the
-form qualifies: cell domain, tensor-product discontinuous scalar space,
-tensor-product ``RegularQuadrature``, plain test field, no trial field, and a
-single injectable input field. The naive ``integrate()`` path is the golden
-oracle throughout: the sum-factorized apply of a form must match the
-matrix-vector product with the legacy-assembled BSR matrix of the same form.
+The sum-factorized path is an explicit opt-in: ``fem.integrate(...,
+assembly="sumfac")`` replaces the standard linear-form integration kernel with
+a fused tile kernel (``B`` interpolation stage, seeded in-kernel Q-function
+``D`` stage, ``B^T`` contraction stage) when the form qualifies: cell domain,
+tensor-product discontinuous scalar space, tensor-product
+``RegularQuadrature``, plain test field, no trial field, and a single
+injectable input field. The default ``integrate()`` path is the golden oracle
+throughout: the sum-factorized apply of a form must match the matrix-vector
+product with the default-assembled BSR matrix of the same form.
 
-The dispatch is driven by ``warp.fem.set_sumfac_mode``: ``"force"`` bypasses
-the low-degree threshold (structural requirements still hold), ``"off"``
-always selects the legacy kernels, and ``"auto"`` selects sum-factorization
-only when applicable. Unqualified forms (side domains, simplex geometries,
-vector-valued spaces, nodal assembly) must silently fall through to the
-legacy path with identical results.
+The sum-factorized path is never selected automatically, and forms that do not
+qualify raise a descriptive error instead of silently falling back.
 
-Degrees are kept to a modest set ({1, 3, 5} in 2D, {1, 2, 4} in 3D) and tile
-shapes are reused across tests to bound first-run CUDA compile times.
+GPU-compiling correctness tests use degree P=4 exclusively (n = q = 5 per
+axis, 2D and 3D) so the apply, assembly, and faces tests share one tile shape
+per dimension, bounding first-run CUDA compile times.
 """
 
 import contextlib
@@ -63,16 +61,21 @@ def vec_mass_form(s: fem.Sample, u: fem.Field, v: fem.Field):
     return wp.dot(u(s), v(s))
 
 
+@fem.integrand
+def rhs_only_form(s: fem.Sample, v: fem.Field):
+    return v(s)
+
+
 # Affine in the test function (nonzero at v = 0): only the value channel of
 # the seeded extraction may be contracted, matching the legacy dispatch path
-# which restricts the Taylor DOFs to the operators actually used.
+# which restricts the Taylor DOFs to the operators in use.
 @fem.integrand
 def affine_offset_form(s: fem.Sample, u: fem.Field, v: fem.Field, w: fem.Field):
     return u(s) * v(s) + w(s)
 
 
 # Dedicated integrands for the cache-isolation test, so the in-process kernel
-# generation order (legacy first vs sum-factorized first) is controlled here.
+# generation order (default first vs sum-factorized first) is controlled here.
 @fem.integrand
 def iso_form_legacy_first(s: fem.Sample, u: fem.Field, v: fem.Field):
     return u(s) * v(s)
@@ -115,18 +118,6 @@ def _make_dg_case(geo, degree, rng):
 
 
 @contextlib.contextmanager
-def _sumfac_mode(mode):
-    """Set the sum-factorization dispatch mode, restoring the previous one on exit."""
-
-    previous = fem_integrate.get_sumfac_mode()
-    fem_integrate.set_sumfac_mode(mode)
-    try:
-        yield
-    finally:
-        fem_integrate.set_sumfac_mode(previous)
-
-
-@contextlib.contextmanager
 def _capture_integrate_kernel():
     """Capture the kernel selected by ``fem.integrate`` for dispatch assertions."""
 
@@ -149,7 +140,7 @@ def _is_sumfac_kernel(kernel):
 
 
 def _check_apply_matches_naive(test, form, geo, degree, rng, values=None):
-    """Sum-factorized apply on a random vector vs legacy-assembled BSR matrix-vector product."""
+    """Sum-factorized apply on a random vector vs default-assembled BSR matrix-vector product."""
 
     space, _domain, test_field, trial_field, quadrature, x = _make_dg_case(geo, degree, rng)
 
@@ -166,13 +157,14 @@ def _check_apply_matches_naive(test, form, geo, degree, rng, values=None):
     u = space.make_field()
     u.dof_values = x_wp
 
-    with _sumfac_mode("force"), _capture_integrate_kernel() as captured:
+    with _capture_integrate_kernel() as captured:
         y_sumfac = fem.integrate(
             form,
             fields={"u": u, "v": test_field},
             quadrature=quadrature,
             values=values,
             output_dtype=wp.float64,
+            assembly="sumfac",
         )
     test.assertTrue(_is_sumfac_kernel(captured["kernel"]), "expected the sum-factorized kernel to be selected")
 
@@ -182,78 +174,64 @@ def _check_apply_matches_naive(test, form, geo, degree, rng, values=None):
 def test_apply_equals_naive_mass_2d(test, device):
     rng = np.random.default_rng(50)
     with wp.ScopedDevice(device):
-        geo = _make_grid_2d()
-        for degree in (1, 3, 5):
-            _check_apply_matches_naive(test, mass_form, geo, degree, rng)
+        _check_apply_matches_naive(test, mass_form, _make_grid_2d(), 4, rng)
 
 
 def test_apply_equals_naive_mass_3d(test, device):
     rng = np.random.default_rng(51)
     with wp.ScopedDevice(device):
-        geo = _make_grid_3d()
-        for degree in (1, 2, 4):
-            _check_apply_matches_naive(test, mass_form, geo, degree, rng)
+        _check_apply_matches_naive(test, mass_form, _make_grid_3d(), 4, rng)
 
 
 def test_apply_equals_naive_stiffness(test, device):
     rng = np.random.default_rng(52)
     with wp.ScopedDevice(device):
-        _check_apply_matches_naive(test, stiffness_form, _make_grid_2d(), 3, rng)
-        _check_apply_matches_naive(test, stiffness_form, _make_grid_3d(), 2, rng)
+        _check_apply_matches_naive(test, stiffness_form, _make_grid_2d(), 4, rng)
+        _check_apply_matches_naive(test, stiffness_form, _make_grid_3d(), 4, rng)
 
 
 def test_apply_equals_naive_advection(test, device):
     rng = np.random.default_rng(53)
     with wp.ScopedDevice(device):
         _check_apply_matches_naive(
-            test, advection_form_2d, _make_grid_2d(), 3, rng, values={"vel": wp.vec2d(0.7, -0.3)}
+            test, advection_form_2d, _make_grid_2d(), 4, rng, values={"vel": wp.vec2d(0.7, -0.3)}
         )
         _check_apply_matches_naive(
-            test, advection_form_3d, _make_grid_3d(), 2, rng, values={"vel": wp.vec3d(0.7, -0.3, 0.45)}
+            test, advection_form_3d, _make_grid_3d(), 4, rng, values={"vel": wp.vec3d(0.7, -0.3, 0.45)}
         )
 
 
-def test_dispatch_selects_sumfac(test, device):
-    """Mode "force" selects the sum-factorized kernel, "off" the legacy one, "auto" only when applicable."""
+def test_assembly_arg_selects_sumfac(test, device):
+    """assembly="sumfac" always selects the sum-factorized kernel; the default never does."""
 
     rng = np.random.default_rng(54)
     with wp.ScopedDevice(device):
         geo = _make_grid_2d()
+        space, _domain, test_field, _trial, quadrature, x = _make_dg_case(geo, 4, rng)
+        u = space.make_field()
+        u.dof_values = wp.array(x, dtype=wp.float64)
 
-        def make_case(degree):
-            space, _domain, test_field, _trial, quadrature, x = _make_dg_case(geo, degree, rng)
-            u = space.make_field()
-            u.dof_values = wp.array(x, dtype=wp.float64)
-            return u, test_field, quadrature
-
-        def integrate_and_capture(case, mode):
-            u, test_field, quadrature = case
-            with _sumfac_mode(mode), _capture_integrate_kernel() as captured:
+        def integrate_and_capture(assembly):
+            with _capture_integrate_kernel() as captured:
                 result = fem.integrate(
                     mass_form,
                     fields={"u": u, "v": test_field},
                     quadrature=quadrature,
                     output_dtype=wp.float64,
+                    assembly=assembly,
                 )
             return captured["kernel"], result.numpy()
 
-        case_high = make_case(5)
-        case_low = make_case(1)
+        kernel_sumfac, res_sumfac = integrate_and_capture("sumfac")
+        kernel_default, res_default = integrate_and_capture(None)
+        kernel_dispatch, res_dispatch = integrate_and_capture("dispatch")
 
-        kernel_force, res_force = integrate_and_capture(case_high, "force")
-        kernel_off, res_off = integrate_and_capture(case_high, "off")
-        kernel_auto_high, res_auto_high = integrate_and_capture(case_high, "auto")
-        kernel_auto_low, _res = integrate_and_capture(case_low, "auto")
-        kernel_force_low, _res = integrate_and_capture(case_low, "force")
+        test.assertTrue(_is_sumfac_kernel(kernel_sumfac))
+        test.assertFalse(_is_sumfac_kernel(kernel_default), "sumfac must never be selected automatically")
+        test.assertFalse(_is_sumfac_kernel(kernel_dispatch), "explicit dispatch must be honored verbatim")
 
-        test.assertTrue(_is_sumfac_kernel(kernel_force))
-        test.assertFalse(_is_sumfac_kernel(kernel_off))
-        test.assertTrue(_is_sumfac_kernel(kernel_auto_high), "P=5 should qualify under auto mode")
-        test.assertFalse(_is_sumfac_kernel(kernel_auto_low), "P=1 is below the low-degree threshold")
-        test.assertTrue(_is_sumfac_kernel(kernel_force_low), "force bypasses the low-degree threshold")
-
-        np.testing.assert_allclose(res_force, res_off, rtol=1e-9, atol=1e-10)
-        np.testing.assert_allclose(res_auto_high, res_off, rtol=1e-9, atol=1e-10)
+        np.testing.assert_allclose(res_sumfac, res_default, rtol=1e-9, atol=1e-10)
+        np.testing.assert_allclose(res_dispatch, res_default, rtol=1e-9, atol=1e-10)
 
 
 def _gen_trimesh(nx, ny):
@@ -264,129 +242,50 @@ def _gen_trimesh(nx, ny):
     return wp.array(positions, dtype=wp.vec2d), wp.array(vidx, dtype=int)
 
 
-def _check_falls_back_to_legacy(test, form, fields, values=None, quadrature=None, assembly=None):
-    """Under mode "force" the form must still take the legacy path, with results identical to mode "off"."""
-
-    def run(mode):
-        with _sumfac_mode(mode), _capture_integrate_kernel() as captured:
-            result = fem.integrate(
-                form,
-                fields=fields,
-                values=values,
-                quadrature=quadrature,
-                assembly=assembly,
-                output_dtype=wp.float64,
-            )
-        return captured["kernel"], result.numpy()
-
-    kernel_force, res_force = run("force")
-    kernel_off, res_off = run("off")
-
-    test.assertFalse(_is_sumfac_kernel(kernel_force), "unqualified form must fall through to the legacy kernel")
-    test.assertIs(kernel_force, kernel_off, "fallback must reuse the exact legacy kernel")
-    assert_np_equal(res_force, res_off)
-
-
-def test_fallback_unqualified(test, device):
-    rng = np.random.default_rng(55)
-    with wp.ScopedDevice(device):
-        # Side (boundary) domain: faces are not supported by the cell-only sum-factorized path
-        geo = _make_grid_2d()
-        space = fem.make_polynomial_space(geo, degree=2, discontinuous=True, dtype=wp.float64)
-        sides = fem.BoundarySides(geo)
-        side_test = fem.make_test(space=space, domain=sides)
-        side_quadrature = fem.RegularQuadrature(sides, order=4)
-        u = space.make_field()
-        u.dof_values = wp.array(rng.uniform(-1.0, 1.0, size=space.node_count()), dtype=wp.float64)
-        _check_falls_back_to_legacy(
-            test, mass_form, fields={"u": u.trace(), "v": side_test}, quadrature=side_quadrature
-        )
-
-        # Simplex geometry: triangle shape functions are not tensor products
-        positions, tri_vidx = _gen_trimesh(3, 2)
-        tri_geo = fem.Trimesh2D(tri_vertex_indices=tri_vidx, positions=positions)
-        tri_space = fem.make_polynomial_space(tri_geo, degree=2, discontinuous=True, dtype=wp.float64)
-        tri_domain = fem.Cells(geometry=tri_geo)
-        tri_test = fem.make_test(space=tri_space, domain=tri_domain)
-        tri_quadrature = fem.RegularQuadrature(tri_domain, order=4)
-        tri_u = tri_space.make_field()
-        tri_u.dof_values = wp.array(rng.uniform(-1.0, 1.0, size=tri_space.node_count()), dtype=wp.float64)
-        _check_falls_back_to_legacy(test, mass_form, fields={"u": tri_u, "v": tri_test}, quadrature=tri_quadrature)
-
-        # Vector-valued space: seeding is scalar-only
-        vec_space = fem.make_polynomial_space(geo, degree=2, discontinuous=True, dtype=wp.vec2d)
-        vec_domain = fem.Cells(geometry=geo)
-        vec_test = fem.make_test(space=vec_space, domain=vec_domain)
-        vec_quadrature = fem.RegularQuadrature(vec_domain, order=4)
-        vec_u = vec_space.make_field()
-        vec_u.dof_values = wp.array(rng.uniform(-1.0, 1.0, size=(vec_space.node_count(), 2)), dtype=wp.vec2d)
-        _check_falls_back_to_legacy(test, vec_mass_form, fields={"u": vec_u, "v": vec_test}, quadrature=vec_quadrature)
-
-        # Nodal assembly: no quadrature, integrates at test nodes
-        nodal_space = fem.make_polynomial_space(geo, degree=2, discontinuous=True, dtype=wp.float64)
-        nodal_domain = fem.Cells(geometry=geo)
-        nodal_test = fem.make_test(space=nodal_space, domain=nodal_domain)
-        nodal_u = nodal_space.make_field()
-        nodal_u.dof_values = wp.array(rng.uniform(-1.0, 1.0, size=nodal_space.node_count()), dtype=wp.float64)
-        _check_falls_back_to_legacy(test, mass_form, fields={"u": nodal_u, "v": nodal_test}, assembly="nodal")
-
-        # Explicit assembly="generic": the documented escape hatch making no
-        # assumption about the integrand's content must be honored verbatim,
-        # even when the form structurally qualifies for sum-factorization.
-        generic_quadrature = fem.RegularQuadrature(nodal_domain, order=4)
-        _check_falls_back_to_legacy(
-            test,
-            mass_form,
-            fields={"u": nodal_u, "v": nodal_test},
-            quadrature=generic_quadrature,
-            assembly="generic",
-        )
-
-
-def test_affine_form_matches_dispatch(test, device):
-    """A grad-free affine-in-test form must reproduce the legacy dispatch semantics exactly.
+def test_affine_form_matches_default(test, device):
+    """A grad-free affine-in-test form must reproduce the default dispatch semantics exactly.
 
     The gradient seeds must not be evaluated when the integrand never applies
     a gradient operator to the test field; otherwise the affine offset would
     contaminate the ``f1`` channels and silently change the result relative to
-    the legacy dispatch path.
+    the default dispatch path.
     """
 
     rng = np.random.default_rng(58)
     with wp.ScopedDevice(device):
         geo = _make_grid_2d()
-        space, _domain, test_field, _trial, quadrature, x = _make_dg_case(geo, 3, rng)
+        space, _domain, test_field, _trial, quadrature, x = _make_dg_case(geo, 4, rng)
         u = space.make_field()
         u.dof_values = wp.array(x, dtype=wp.float64)
         w = space.make_field()
         w.dof_values = wp.array(rng.uniform(-1.0, 1.0, size=space.node_count()), dtype=wp.float64)
 
-        def run(mode):
-            with _sumfac_mode(mode), _capture_integrate_kernel() as captured:
+        def run(assembly):
+            with _capture_integrate_kernel() as captured:
                 result = fem.integrate(
                     affine_offset_form,
                     fields={"u": u, "v": test_field, "w": w},
                     quadrature=quadrature,
                     output_dtype=wp.float64,
+                    assembly=assembly,
                 )
             return captured["kernel"], result.numpy()
 
-        kernel_force, res_force = run("force")
-        kernel_off, res_off = run("off")
+        kernel_sumfac, res_sumfac = run("sumfac")
+        kernel_default, res_default = run(None)
 
-        test.assertTrue(_is_sumfac_kernel(kernel_force))
-        test.assertFalse(_is_sumfac_kernel(kernel_off))
-        np.testing.assert_allclose(res_force, res_off, rtol=1e-9, atol=1e-10)
+        test.assertTrue(_is_sumfac_kernel(kernel_sumfac))
+        test.assertFalse(_is_sumfac_kernel(kernel_default))
+        np.testing.assert_allclose(res_sumfac, res_default, rtol=1e-9, atol=1e-10)
 
 
 def test_matrix_free_solve(test, device):
     """CG with the matrix-free sum-factorized operator matches the assembled-matrix solve."""
 
     rng = np.random.default_rng(56)
-    mode_before = fem_integrate.get_sumfac_mode()
     with wp.ScopedDevice(device):
         geo = _make_grid_2d()
-        space, _domain, test_field, trial_field, quadrature, _x = _make_dg_case(geo, 3, rng)
+        space, _domain, test_field, trial_field, quadrature, _x = _make_dg_case(geo, 4, rng)
 
         matrix = fem.integrate(
             mass_form,
@@ -417,38 +316,40 @@ def test_matrix_free_solve(test, device):
 
         np.testing.assert_allclose(x_matfree.numpy(), x_assembled.numpy(), rtol=1e-6, atol=1e-9)
 
-        # The apply must not leave the caller's field bound to the solver iterate,
-        # nor flip the process-global sum-factorization mode.
+        # The apply must not leave the caller's field bound to the solver iterate.
         test.assertIs(u_op.dof_values, u_op_dofs, "matvec must restore the input field's dof_values")
-        test.assertEqual(fem_integrate.get_sumfac_mode(), mode_before)
 
 
-def _check_cache_isolation(test, form, geo, rng, first_mode, second_mode):
+def _check_cache_isolation(test, form, geo, rng, first_assembly, second_assembly):
     """Generating the kernels in either order never returns the wrong cached kernel."""
 
-    space, _domain, test_field, _trial, quadrature, x = _make_dg_case(geo, 3, rng)
+    space, _domain, test_field, _trial, quadrature, x = _make_dg_case(geo, 4, rng)
     u = space.make_field()
     u.dof_values = wp.array(x, dtype=wp.float64)
 
-    def run(mode):
-        with _sumfac_mode(mode), _capture_integrate_kernel() as captured:
+    def run(assembly):
+        with _capture_integrate_kernel() as captured:
             result = fem.integrate(
-                form, fields={"u": u, "v": test_field}, quadrature=quadrature, output_dtype=wp.float64
+                form,
+                fields={"u": u, "v": test_field},
+                quadrature=quadrature,
+                output_dtype=wp.float64,
+                assembly=assembly,
             )
         return captured["kernel"], result.numpy()
 
-    kernel_first, res_first = run(first_mode)
-    kernel_second, res_second = run(second_mode)
+    kernel_first, res_first = run(first_assembly)
+    kernel_second, res_second = run(second_assembly)
 
-    test.assertIsNot(kernel_first, kernel_second, "legacy and sum-factorized kernels must not share a cache entry")
-    sumfac_kernel = kernel_first if first_mode == "force" else kernel_second
-    legacy_kernel = kernel_second if first_mode == "force" else kernel_first
+    test.assertIsNot(kernel_first, kernel_second, "default and sum-factorized kernels must not share a cache entry")
+    sumfac_kernel = kernel_first if first_assembly == "sumfac" else kernel_second
+    legacy_kernel = kernel_second if first_assembly == "sumfac" else kernel_first
     test.assertTrue(_is_sumfac_kernel(sumfac_kernel))
     test.assertFalse(_is_sumfac_kernel(legacy_kernel))
 
-    # Repeat in the same order: each mode must hit its own cached kernel
-    kernel_first_again, _res = run(first_mode)
-    kernel_second_again, _res = run(second_mode)
+    # Repeat in the same order: each assembly must hit its own cached kernel
+    kernel_first_again, _res = run(first_assembly)
+    kernel_second_again, _res = run(second_assembly)
     test.assertIs(kernel_first_again, kernel_first)
     test.assertIs(kernel_second_again, kernel_second)
 
@@ -459,15 +360,88 @@ def test_seed_substitution_cache_isolation(test, device):
     rng = np.random.default_rng(57)
     with wp.ScopedDevice(device):
         geo = _make_grid_2d()
-        _check_cache_isolation(test, iso_form_legacy_first, geo, rng, first_mode="off", second_mode="force")
-        _check_cache_isolation(test, iso_form_sumfac_first, geo, rng, first_mode="force", second_mode="off")
+        _check_cache_isolation(test, iso_form_legacy_first, geo, rng, first_assembly=None, second_assembly="sumfac")
+        _check_cache_isolation(test, iso_form_sumfac_first, geo, rng, first_assembly="sumfac", second_assembly=None)
 
 
 devices = get_test_devices()
 
 
 class TestFemSumfacApply(unittest.TestCase):
-    pass
+    def test_sumfac_raises_unqualified(self):
+        """assembly="sumfac" raises a descriptive error for every unqualified form (host-side, no compiles)."""
+
+        rng = np.random.default_rng(55)
+        geo = _make_grid_2d()
+        space, _domain, test_field, _trial, quadrature, x = _make_dg_case(geo, 4, rng)
+        u = space.make_field()
+        u.dof_values = wp.array(x, dtype=wp.float64)
+
+        def integrate_sumfac(form, fields, **kwargs):
+            kwargs.setdefault("output_dtype", wp.float64)
+            return fem.integrate(form, fields=fields, assembly="sumfac", **kwargs)
+
+        # Side (boundary) domain: faces are not supported by the cell-only sum-factorized path
+        sides = fem.BoundarySides(geo)
+        side_test = fem.make_test(space=space, domain=sides)
+        side_quadrature = fem.RegularQuadrature(sides, order=4)
+        with self.assertRaisesRegex(NotImplementedError, "cell domains"):
+            integrate_sumfac(mass_form, {"u": u.trace(), "v": side_test}, quadrature=side_quadrature)
+
+        # Simplex geometry: triangle shape functions are not tensor products
+        positions, tri_vidx = _gen_trimesh(3, 2)
+        tri_geo = fem.Trimesh2D(tri_vertex_indices=tri_vidx, positions=positions)
+        tri_space = fem.make_polynomial_space(tri_geo, degree=2, discontinuous=True, dtype=wp.float64)
+        tri_domain = fem.Cells(geometry=tri_geo)
+        tri_test = fem.make_test(space=tri_space, domain=tri_domain)
+        tri_quadrature = fem.RegularQuadrature(tri_domain, order=4)
+        tri_u = tri_space.make_field()
+        tri_u.dof_values = wp.array(rng.uniform(-1.0, 1.0, size=tri_space.node_count()), dtype=wp.float64)
+        with self.assertRaisesRegex(NotImplementedError, "tensor-product"):
+            integrate_sumfac(mass_form, {"u": tri_u, "v": tri_test}, quadrature=tri_quadrature)
+
+        # Vector-valued space: seeding is scalar-only
+        vec_space = fem.make_polynomial_space(geo, degree=2, discontinuous=True, dtype=wp.vec2d)
+        vec_domain = fem.Cells(geometry=geo)
+        vec_test = fem.make_test(space=vec_space, domain=vec_domain)
+        vec_quadrature = fem.RegularQuadrature(vec_domain, order=4)
+        vec_u = vec_space.make_field()
+        vec_u.dof_values = wp.array(rng.uniform(-1.0, 1.0, size=(vec_space.node_count(), 2)), dtype=wp.vec2d)
+        with self.assertRaisesRegex(NotImplementedError, "scalar"):
+            integrate_sumfac(vec_mass_form, {"u": vec_u, "v": vec_test}, quadrature=vec_quadrature)
+
+        # Backward kernel generation is unsupported
+        with self.assertRaisesRegex(NotImplementedError, "backward"):
+            integrate_sumfac(
+                mass_form,
+                {"u": u, "v": test_field},
+                quadrature=quadrature,
+                kernel_options={"enable_backward": True},
+            )
+
+        # Differentiable field inputs are unsupported
+        u_grad = space.make_field()
+        u_grad.dof_values = wp.array(x, dtype=wp.float64, requires_grad=True)
+        with self.assertRaisesRegex(NotImplementedError, "differentiable field inputs"):
+            integrate_sumfac(mass_form, {"u": u_grad, "v": test_field}, quadrature=quadrature)
+
+        # Differentiable outputs are unsupported
+        out_grad = wp.zeros(space.node_count(), dtype=wp.float64, requires_grad=True)
+        with self.assertRaisesRegex(NotImplementedError, "differentiable outputs"):
+            integrate_sumfac(mass_form, {"u": u, "v": test_field}, quadrature=quadrature, output=out_grad)
+
+        # Accumulation dtype must be float32 or float64
+        with self.assertRaisesRegex(NotImplementedError, "accumulation"):
+            integrate_sumfac(
+                mass_form,
+                {"u": u, "v": test_field},
+                quadrature=quadrature,
+                accumulate_dtype=wp.float16,
+            )
+
+        # No injectable input field (pure right-hand-side form)
+        with self.assertRaisesRegex(NotImplementedError, "input field"):
+            integrate_sumfac(rhs_only_form, {"v": test_field}, quadrature=quadrature)
 
 
 add_function_test(
@@ -482,10 +456,11 @@ add_function_test(
 add_function_test(
     TestFemSumfacApply, "test_apply_equals_naive_advection", test_apply_equals_naive_advection, devices=devices
 )
-add_function_test(TestFemSumfacApply, "test_dispatch_selects_sumfac", test_dispatch_selects_sumfac, devices=devices)
-add_function_test(TestFemSumfacApply, "test_fallback_unqualified", test_fallback_unqualified, devices=devices)
 add_function_test(
-    TestFemSumfacApply, "test_affine_form_matches_dispatch", test_affine_form_matches_dispatch, devices=devices
+    TestFemSumfacApply, "test_assembly_arg_selects_sumfac", test_assembly_arg_selects_sumfac, devices=devices
+)
+add_function_test(
+    TestFemSumfacApply, "test_affine_form_matches_default", test_affine_form_matches_default, devices=devices
 )
 add_function_test(TestFemSumfacApply, "test_matrix_free_solve", test_matrix_free_solve, devices=devices)
 add_function_test(

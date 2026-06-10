@@ -9,22 +9,26 @@ value and reference gradient at quadrature points for quad (2D) and hex (3D)
 tensor-product elements. The golden reference is the dense Kronecker-product
 operator ``Kron(...) @ vec(dofs)`` built with NumPy:
 
-* 2D value reproduces ``Kron(I, I) @ vec(U)`` (sub-step 1, P=1..5).
+* 2D value reproduces ``Kron(I, I) @ vec(U)`` (sub-step 1).
 * 2D reference gradient reproduces ``Kron(D_ref, I)`` and ``Kron(I, D_ref)``
-  (sub-step 2, P=1..5).
+  (sub-step 2).
 * 3D value and reference gradient reproduce the three-factor Kronecker products
-  (sub-step 3, P=1..4).
+  (sub-step 3).
 * Batching ``E_b = 4`` elements into one wider RHS tile matches looping the
-  ``E_b = 1`` path element by element (sub-step 4, P=1..5, 2D and 3D).
+  ``E_b = 1`` path element by element (sub-step 4, 2D and 3D).
 * The transpose contraction ``B^T`` reproduces ``g @ Kron(...)`` for the value
   operator and every gradient operator, in 2D and 3D, including ``E_b = 4``
-  batching, and the residual accumulation driver matches the dense
+  batching, and the residual accumulation matches the dense
   ``(1 + dim)``-term sum.
 * The full ``B^T D B`` mass pipeline (``D`` = diagonal tensor-product GL
   weights) matches the dense Kronecker-built mass-matrix action.
 * Over-integration (``q != n``) with rectangular ``(q, n)`` operators matches
   the dense references in 2D and 3D, forward and transpose, so the kernel
   factories stay general in ``(rows_in, rows_out)``.
+
+GPU-compiling tests use degree P=4 exclusively (n = q = 5 per axis), with the
+single deliberate exception of the rectangular over-integration case (degree 2,
+q = 5 != n = 3), keeping the number of distinct compiled tile shapes small.
 
 The contraction runs in Warp tile kernels (``block_dim = 1`` on CPU) so the
 tests run on every device returned by ``get_test_devices()``.
@@ -97,7 +101,7 @@ def contract_transpose_residual_3d(f0, f1_xi, f1_eta, f1_zeta, interp, deriv, n,
 def test_interpolate_2d_value(test, device):
     # Sub-step 1: 2D value interpolation vs dense Kron(I, I), E_b = 1.
     rng = np.random.default_rng(0)
-    for degree in range(1, 6):
+    for degree in (4,):
         interp, _ = build_operator_arrays(degree)
         n = degree + 1
         q = len(default_quadrature_points(degree))
@@ -118,7 +122,7 @@ def test_interpolate_2d_value(test, device):
 def test_interpolate_2d_gradient(test, device):
     # Sub-step 2: 2D reference gradient (d/dxi, d/deta) vs dense Kron(D, I) / Kron(I, D).
     rng = np.random.default_rng(1)
-    for degree in range(1, 6):
+    for degree in (4,):
         interp, deriv = build_operator_arrays(degree)
         n = degree + 1
         q = len(default_quadrature_points(degree))
@@ -143,7 +147,7 @@ def test_interpolate_2d_gradient(test, device):
 def test_interpolate_3d_value_and_gradient(test, device):
     # Sub-step 3: 3D value and reference gradient vs dense three-factor Kron products.
     rng = np.random.default_rng(2)
-    for degree in range(1, 5):
+    for degree in (4,):
         interp, deriv = build_operator_arrays(degree)
         n = degree + 1
         q = len(default_quadrature_points(degree))
@@ -179,7 +183,7 @@ def test_interpolate_2d_batched(test, device):
     # Sub-step 4: E_b = 4 batching matches looping the E_b = 1 path element by element.
     rng = np.random.default_rng(3)
     element_batch = 4
-    for degree in range(1, 6):
+    for degree in (4,):
         interp, _ = build_operator_arrays(degree)
         n = degree + 1
         q = len(default_quadrature_points(degree))
@@ -200,7 +204,7 @@ def test_interpolate_3d_batched(test, device):
     # 3D analog of sub-step 4: E_b = 4 batching matches the E_b = 1 path.
     rng = np.random.default_rng(4)
     element_batch = 4
-    for degree in (1, 2):
+    for degree in (4,):
         interp, _ = build_operator_arrays(degree)
         n = degree + 1
         q = len(default_quadrature_points(degree))
@@ -224,7 +228,7 @@ def test_backward_contract_is_transpose_2d(test, device):
     # must equal the dense transpose action g @ Kron(A, B) for the value operator
     # and both gradient operators.
     rng = np.random.default_rng(5)
-    for degree in (1, 3, 5):
+    for degree in (4,):
         interp, deriv = build_operator_arrays(degree)
         n = degree + 1
         q = len(default_quadrature_points(degree))
@@ -262,7 +266,7 @@ def test_backward_contract_is_transpose_2d(test, device):
 def test_backward_contract_is_transpose_3d(test, device):
     # 3D B^T stage vs the dense three-factor Kronecker transpose action.
     rng = np.random.default_rng(6)
-    for degree in (1, 2, 4):
+    for degree in (4,):
         interp, deriv = build_operator_arrays(degree)
         n = degree + 1
         q = len(default_quadrature_points(degree))
@@ -310,7 +314,7 @@ def test_backward_batched(test, device):
     rng = np.random.default_rng(7)
     element_batch = 4
 
-    for degree in (1, 3):
+    for degree in (4,):
         interp, deriv = build_operator_arrays(degree)
         n = degree + 1
         q = len(default_quadrature_points(degree))
@@ -324,7 +328,7 @@ def test_backward_batched(test, device):
             batched, looped, atol=ATOL_F64, err_msg=f"2D batched (E_b=4) transpose mismatch for degree={degree}"
         )
 
-    for degree in (1, 2):
+    for degree in (4,):
         interp, deriv = build_operator_arrays(degree)
         n = degree + 1
         q = len(default_quadrature_points(degree))
@@ -343,7 +347,7 @@ def test_forward_backward_roundtrip_mass(test, device):
     # Full B^T D B pipeline shape for the mass operator: B^T (W * (B u)) must
     # equal the dense mass-matrix action with D = diag of tensor-product GL weights.
     rng = np.random.default_rng(8)
-    degree = 3
+    degree = 4
     interp, _ = build_operator_arrays(degree)
     n = degree + 1
     q = len(default_quadrature_points(degree))

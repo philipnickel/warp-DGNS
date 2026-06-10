@@ -22,6 +22,11 @@
   and bilinear forms in `fem.integrate()`, covering both the matrix-free apply and the assembly of the sparse matrix.
   Qualifying forms are detected automatically; use `fem.set_sumfac_mode()` (`"auto"`, `"force"`, or `"off"`) or the
   `WARP_FEM_SUMFAC` environment variable to override the dispatch for A/B testing.
+- `warp.fem`: Add an opt-in sum-factorized path for high-order tensor-product discontinuous-Galerkin forms:
+  `fem.integrate(..., assembly="sumfac")` selects fused `BᵀDB` kernels for both the matrix-free apply of linear forms
+  and the assembly of bilinear forms to a sparse matrix. Requires a cell domain over a tensor-product geometry, a
+  scalar discontinuous tensor-product polynomial space, and a matching `RegularQuadrature`; forms that do not qualify
+  raise an error describing the unmet requirement.
 
 ### Removed
 

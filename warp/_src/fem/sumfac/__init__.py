@@ -10,6 +10,7 @@ overall ``B^T D B`` factorization.
 """
 
 from warp._src.fem.sumfac.kernels import (
+    SumfacNotApplicableError,
     make_sumfac_linear_operator,
 )
 from warp._src.fem.sumfac.operators_1d import (
@@ -24,6 +25,7 @@ from warp._src.fem.sumfac.qfunction import (
 )
 
 __all__ = [
+    "SumfacNotApplicableError",
     "build_derivative_matrix",
     "build_interpolation_matrix",
     "default_basis_nodes",
