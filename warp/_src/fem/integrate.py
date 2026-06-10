@@ -640,6 +640,7 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
         domain_index_var_name: str = "domain_index_arg",
         sample_var_name: str = "sample",
         field_wrappers_attr: str = "_field_wrappers",
+        domain_geo_var_name: str | None = None,
     ):
         self._arg_names = arg_names
         self._field_args = parsed_args.field_args
@@ -654,6 +655,13 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
         self._domain_var_name = domain_var_name
         self._domain_index_var_name = domain_index_var_name
         self._sample_var_name = sample_var_name
+        # When set, the integrand's Domain argument is built from this local
+        # variable instead of the kernel's domain element arg; the fused
+        # sum-factorized side kernel uses it to substitute a per-face
+        # geometry-injected element arg (see
+        # warp._src.fem.sumfac.side_kernels.SideConstantGeometryDomain) while
+        # field arguments keep receiving the native element arg.
+        self._domain_geo_var_name = domain_geo_var_name
 
         self._field_wrappers_attr = field_wrappers_attr
         self._register_integrand_field_wrappers(integrand_func, parsed_args.field_args)
@@ -672,7 +680,7 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
                 setattr(field_wrappers, name, field.DomainArg)
         setattr(integrand_func, self._field_wrappers_attr, field_wrappers)
 
-    def _emit_field_wrapper_call(self, field_name, *data_arguments):
+    def _emit_field_wrapper_call(self, field_name, *data_arguments, elt_var_name: str | None = None):
         return ast.Call(
             func=ast.Attribute(
                 value=ast.Attribute(
@@ -684,7 +692,7 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
                 ctx=ast.Load(),
             ),
             args=[
-                ast.Name(id=self._domain_var_name, ctx=ast.Load()),
+                ast.Name(id=elt_var_name or self._domain_var_name, ctx=ast.Load()),
                 *data_arguments,
             ],
             keywords=[],
@@ -704,6 +712,7 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
                         self._emit_field_wrapper_call(
                             arg,
                             ast.Name(id=self._domain_index_var_name, ctx=ast.Load()),
+                            elt_var_name=self._domain_geo_var_name,
                         )
                     )
 
@@ -1284,6 +1293,7 @@ def _generate_integrate_kernel(
                 # trace gather; discriminate on the concrete class so a future
                 # NodalField subclass cannot silently reuse the base kernel.
                 type(sumfac_plan.cell_field).__qualname__,
+                domain.name,
                 quadrature.name,
                 field_names,
                 cache.pod_type_key(output_dtype),
@@ -1357,6 +1367,7 @@ def _generate_integrate_kernel(
                     dim=sumfac_plan.dim,
                     test_uses_grad=sumfac_plan.test_uses_grad,
                     accumulate_dtype=accumulate_dtype,
+                    injected_domain=sumfac_plan.injected_domain,
                 )
 
                 copied_field_names = [
@@ -1374,6 +1385,10 @@ def _generate_integrate_kernel(
                         parsed_args=arguments,
                         integrand_func=integrand_func,
                         fields_var_name="qp_fields",
+                        # The integrand's Domain argument reads the per-face
+                        # injected element arg (side-constant geometry); field
+                        # arguments keep the native domain_arg.
+                        domain_geo_var_name="qp_domain_geo",
                     ),
                 ]
             elif is_bilinear:
@@ -1831,7 +1846,9 @@ def _launch_integrate_kernel(
 
             nodes_per_element = sumfac_plan.nodes_per_element
 
-            end_ops_arr, tang_ops_arr = sumfac_plan.operator_arrays(accumulate_dtype, device)
+            end_ops_arr, end_ops_t_arr, tang_ops_arr, tang_ops_t_arr = sumfac_plan.operator_arrays(
+                accumulate_dtype, device
+            )
             input_eval_arg = sumfac_plan.cell_field.EvalArg()
             sumfac_plan.cell_field.fill_eval_arg(input_eval_arg, device)
 
@@ -1859,12 +1876,19 @@ def _launch_integrate_kernel(
                         value_struct_values,
                         input_eval_arg,
                         end_ops_arr,
+                        end_ops_t_arr,
                         tang_ops_arr,
+                        tang_ops_t_arr,
                         face_map,
                         active_cells,
+                        # Plain runtime-valued loop bound (always 2): keeps the
+                        # kernel's axis/face loops dynamic so their tile
+                        # temporaries are emitted (and their shared memory
+                        # allocated) once instead of per unrolled iteration.
+                        2,
                         staging,
                     ],
-                    block_dim=sumfac_kernels.sumfac_block_dim(device),
+                    block_dim=sumfac_side_kernels.sumfac_side_block_dim(device),
                     device=device,
                 )
 

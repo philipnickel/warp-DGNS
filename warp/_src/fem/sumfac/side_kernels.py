@@ -53,6 +53,7 @@ Bilinear side forms stay on the default assembly path.
 """
 
 from dataclasses import dataclass
+from functools import cached_property
 
 import numpy as np
 
@@ -92,6 +93,7 @@ from warp._src.fem.types import (
 from warp._src.fem.utils import masked_indices
 
 __all__ = [
+    "SideConstantGeometryDomain",
     "SumfacSideLayout",
     "SumfacSidePlan",
     "find_sumfac_side_layout",
@@ -99,7 +101,286 @@ __all__ = [
     "get_side_gather_arrays",
     "get_sumfac_side_scatter_kernel",
     "make_sumfac_side_plan",
+    "sumfac_side_block_dim",
 ]
+
+
+def sumfac_side_block_dim(device) -> int:
+    """Pick the tile-kernel block size of the fused side kernel for ``device``.
+
+    CPU tile kernels run serialized with a single thread per block. On CUDA
+    the side kernel uses 32 threads (one warp, the ``tile_matmul`` cuBLASDx
+    minimum) instead of the volume kernels' 64: its GEMMs are small and its
+    seeded D stage is scalar code executed redundantly by every thread of the
+    block, so halving the block halves the redundant lanes (measured faster
+    on the SIP side-apply benchmark; see
+    ``design/sumfac-phase6-perf-analysis.md``).
+    """
+    return 1 if wp.get_device(device).is_cpu else 32
+
+
+class SideConstantGeometryDomain(GeometryDomain):
+    """Side-domain stand-in whose side-constant geometry factors are injected per face.
+
+    On ``Grid2D``/``Grid3D`` sides the normal, the side measure, and the
+    measure ratio are constant per side. The fused side kernel evaluates them
+    ONCE per face through the native machinery and injects them into the
+    integrand's ``Domain`` argument (extra ``ElementArg`` members), instead of
+    re-deriving them inside every seeded integrand evaluation -- each
+    derivation re-decodes the grid side, which the perf analysis identified as
+    the dominant scalar cost of the D stage
+    (``design/sumfac-phase6-perf-analysis.md``). Every other domain operator
+    (position, deformation gradient, inner/outer cell maps, ...) forwards to
+    the native implementation through the embedded base element arg, so
+    integrands keep their full generality; the side-apply oracle tests verify
+    exact equality with the native evaluation (including the
+    position-dependent coefficient forms).
+
+    This class only serves generated-type and operator-resolution duties; it
+    is never used host-side to fill launch arguments (the kernel fills the
+    injected members in-kernel, block-uniformly per face, and the field
+    arguments keep receiving the native element arg through the kernel's
+    ``domain_arg`` parameter).
+
+    Args:
+        base: The native side domain being stood in for.
+    """
+
+    def __init__(self, base: GeometryDomain):
+        super().__init__(base.geometry_partition)
+        self._base = base
+        # Sides do not support position lookups; mirror the base domain.
+        self.element_lookup = getattr(base, "element_lookup", None)
+        self.element_partition_lookup = getattr(base, "element_partition_lookup", None)
+
+    @cached_property
+    def name(self) -> str:
+        """Unique name, discriminating the injected stand-in from its base domain."""
+        return f"{self._base.name}_SideConstInj"
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, SideConstantGeometryDomain) and self._base == other._base
+
+    @property
+    def element_kind(self) -> ElementKind:
+        """Kind of elements contained in the domain (always sides)."""
+        return self._base.element_kind
+
+    @property
+    def dimension(self) -> int:
+        """Dimension of the side elements."""
+        return self._base.dimension
+
+    def element_count(self) -> int:
+        """Number of elements in the domain."""
+        return self._base.element_count()
+
+    def geometry_element_count(self) -> int:
+        """Number of elements in the underlying geometry."""
+        return self._base.geometry_element_count()
+
+    def reference_element(self):
+        """Reference element of the base domain."""
+        return self._base.reference_element()
+
+    def supports_lookup(self, device) -> bool:
+        """Whether position lookups are supported (forwards to the base domain)."""
+        return self._base.supports_lookup(device)
+
+    def element_arg_value(self, device):
+        """Unsupported: the injected element arg is filled in-kernel, per face."""
+        raise RuntimeError(
+            "SideConstantGeometryDomain has no host-side element arg value; the fused side kernel fills its "
+            "ElementArg in-kernel"
+        )
+
+    def cell_domain(self):
+        """Cell domain of the base side domain."""
+        return self._base.cell_domain()
+
+    @property
+    def ElementIndexArg(self):
+        """Element indexing argument struct (the base domain's)."""
+        return self._base.ElementIndexArg
+
+    @property
+    def element_index(self):
+        """Device function mapping domain element indices to side indices (the base domain's)."""
+        return self._base.element_index
+
+    @property
+    def element_partition_index(self):
+        """Device function mapping side indices to domain element indices (the base domain's)."""
+        return self._base.element_partition_index
+
+    @cached_property
+    def ElementArg(self):
+        """Element arg embedding the base arg plus the injected side-constant factors."""
+        geometry = self.geometry
+        base_arg = self._base.ElementArg
+        normal_type = cache.cached_vec_type(length=geometry.dimension, dtype=geometry.scalar_type)
+        scalar_type = geometry.scalar_type
+
+        @cache.dynamic_struct(suffix=self.name)
+        class SideConstantElementArg:
+            base: base_arg
+            normal: normal_type
+            measure: scalar_type
+            measure_ratio: scalar_type
+
+        return SideConstantElementArg
+
+    # -- Injected side-constant quantities -----------------------------------
+
+    @cached_property
+    def element_normal(self):
+        """Device function returning the injected per-face normal."""
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_const_normal(args: self.ElementArg, s: self.geometry.sample_type):
+            return args.normal
+
+        return side_const_normal
+
+    @cached_property
+    def element_measure(self):
+        """Device function returning the injected per-face side measure."""
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_const_measure(args: self.ElementArg, s: self.geometry.sample_type):
+            return args.measure
+
+        return side_const_measure
+
+    @cached_property
+    def element_measure_ratio(self):
+        """Device function returning the injected per-face measure ratio."""
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_const_measure_ratio(args: self.ElementArg, s: self.geometry.sample_type):
+            return args.measure_ratio
+
+        return side_const_measure_ratio
+
+    # -- Operators forwarded to the native side machinery ---------------------
+
+    def _forward_sample_func(self, base_fn, fn_suffix: str):
+        @cache.dynamic_func(suffix=f"{self.name}_{fn_suffix}")
+        def side_inj_forward(args: self.ElementArg, s: self.geometry.sample_type):
+            return base_fn(args.base, s)
+
+        return side_inj_forward
+
+    @cached_property
+    def element_position(self):
+        """Device function forwarding position evaluation to the base domain."""
+        return self._forward_sample_func(self._base.element_position, "pos")
+
+    @cached_property
+    def element_deformation_gradient(self):
+        """Device function forwarding deformation-gradient evaluation to the base domain."""
+        return self._forward_sample_func(self._base.element_deformation_gradient, "defgrad")
+
+    @cached_property
+    def element_environment_index(self):
+        """Device function forwarding environment-index evaluation to the base domain."""
+        return self._forward_sample_func(self._base.element_environment_index, "envidx")
+
+    @cached_property
+    def element_inner_cell_index(self):
+        """Device function forwarding inner-cell index lookup to the base domain."""
+        base_fn = self._base.element_inner_cell_index
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_inj_inner_cell_index(args: self.ElementArg, side_index: int):
+            return base_fn(args.base, side_index)
+
+        return side_inj_inner_cell_index
+
+    @cached_property
+    def element_outer_cell_index(self):
+        """Device function forwarding outer-cell index lookup to the base domain."""
+        base_fn = self._base.element_outer_cell_index
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_inj_outer_cell_index(args: self.ElementArg, side_index: int):
+            return base_fn(args.base, side_index)
+
+        return side_inj_outer_cell_index
+
+    @cached_property
+    def element_inner_cell_coords(self):
+        """Device function forwarding inner-cell coordinate mapping to the base domain."""
+        base_fn = self._base.element_inner_cell_coords
+        coords_t = cached_coords_type(self.geometry.scalar_type)
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_inj_inner_cell_coords(args: self.ElementArg, side_index: int, side_coords: coords_t):
+            return base_fn(args.base, side_index, side_coords)
+
+        return side_inj_inner_cell_coords
+
+    @cached_property
+    def element_outer_cell_coords(self):
+        """Device function forwarding outer-cell coordinate mapping to the base domain."""
+        base_fn = self._base.element_outer_cell_coords
+        coords_t = cached_coords_type(self.geometry.scalar_type)
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_inj_outer_cell_coords(args: self.ElementArg, side_index: int, side_coords: coords_t):
+            return base_fn(args.base, side_index, side_coords)
+
+        return side_inj_outer_cell_coords
+
+    @cached_property
+    def cell_to_element_coords(self):
+        """Device function forwarding cell-to-side coordinate conversion to the base domain."""
+        base_fn = self._base.cell_to_element_coords
+        coords_t = cached_coords_type(self.geometry.scalar_type)
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_inj_cell_to_element_coords(
+            args: self.ElementArg, side_index: int, element_index: int, element_coords: coords_t
+        ):
+            return base_fn(args.base, side_index, element_index, element_coords)
+
+        return side_inj_cell_to_element_coords
+
+    @cached_property
+    def element_coordinates(self):
+        """Device function forwarding world-to-side coordinate queries to the base domain."""
+        base_fn = self._base.element_coordinates
+        pos_t = cache.cached_vec_type(length=self.geometry.dimension, dtype=self.geometry.scalar_type)
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_inj_coordinates(args: self.ElementArg, element_index: int, pos: pos_t):
+            return base_fn(args.base, element_index, pos)
+
+        return side_inj_coordinates
+
+    @cached_property
+    def element_closest_point(self):
+        """Device function forwarding closest-point queries to the base domain."""
+        base_fn = self._base.element_closest_point
+        pos_t = cache.cached_vec_type(length=self.geometry.dimension, dtype=self.geometry.scalar_type)
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_inj_closest_point(args: self.ElementArg, element_index: int, pos: pos_t):
+            return base_fn(args.base, element_index, pos)
+
+        return side_inj_closest_point
+
+    @cached_property
+    def domain_cell_arg(self):
+        """Device function mapping the injected domain arg to the base cell-domain arg."""
+        base_fn = self._base.domain_cell_arg
+        BaseDomainArg = self._base.DomainArg
+
+        @cache.dynamic_func(suffix=self.name)
+        def side_inj_domain_cell_arg(x: self.DomainArg):
+            return base_fn(BaseDomainArg(x.geo.base, x.index))
+
+        return side_inj_domain_cell_arg
 
 
 def _tensor_product_side_quadrature_points_1d(quadrature: RegularQuadrature, face_dim: int) -> np.ndarray:
@@ -210,6 +491,8 @@ class SumfacSidePlan:
     * ``tang_ops`` (4q, n): rows ``[interp; deriv; interp_flipped;
       deriv_flipped]`` -- the 1D operators at the side quadrature points and
       at their longitude-flipped images ``1 - t``.
+    * ``end_ops_t`` / ``tang_ops_t``: contiguous transposes of the above, so
+      the kernel never feeds a transposed operand to ``tile_matmul``.
     """
 
     test: TestField
@@ -219,6 +502,7 @@ class SumfacSidePlan:
     cell_field: NodalField
     seed_field: SideSeedField
     injected_field: SideTraceInjectedField
+    injected_domain: SideConstantGeometryDomain
     degree: int
     n: int
     q: int
@@ -226,15 +510,19 @@ class SumfacSidePlan:
     test_uses_grad: bool
     end_ops: np.ndarray
     tang_ops: np.ndarray
+    end_ops_t: np.ndarray
+    tang_ops_t: np.ndarray
 
     @property
     def nodes_per_element(self) -> int:
         """Number of nodes per cell, ``n**dim``."""
         return self.n**self.dim
 
-    def operator_arrays(self, dtype, device) -> tuple[wp.array, wp.array]:
-        """Return the ``(end_ops, tang_ops)`` device arrays in ``dtype`` on ``device``, cached."""
-        return _get_operator_arrays(self.end_ops, self.tang_ops, dtype, device)
+    def operator_arrays(self, dtype, device) -> tuple[wp.array, wp.array, wp.array, wp.array]:
+        """Return the ``(end_ops, end_ops_t, tang_ops, tang_ops_t)`` device arrays in ``dtype`` on ``device``, cached."""
+        ops = _get_operator_arrays(self.end_ops, self.tang_ops, dtype, device)
+        ops_t = _get_operator_arrays(self.end_ops_t, self.tang_ops_t, dtype, device)
+        return ops[0], ops_t[0], ops[1], ops_t[1]
 
 
 def find_sumfac_side_layout(
@@ -346,6 +634,29 @@ def find_sumfac_side_layout(
     )
 
 
+#: Plan cache: rebuilding the side plan dominates the per-apply host cost
+#: (operator-matrix construction, quadrature tensor-product verification,
+#: stand-in field creation), so plans are cached per argument-object identity.
+#: The cached value pins strong references to every id()-keyed object, so a
+#: key can never alias a collected object.
+_side_plan_cache: dict = {}
+
+
+def _side_plan_cache_key(integrand, arguments, test, quadrature, domain):
+    """Identity-based cache key of a side plan: same objects, same plan."""
+    field_ids = []
+    for name, field in arguments.field_args.items():
+        if isinstance(field, NodalField.Trace):
+            # Re-creating ``field.trace()`` per apply is the common matrix-free
+            # pattern; the plan only depends on the underlying cell field.
+            field_ids.append((name, "trace", id(field.cell_field)))
+        elif isinstance(field, GeometryDomain):
+            field_ids.append((name, "domain", id(field)))
+        else:
+            field_ids.append((name, type(field).__qualname__, id(field)))
+    return (id(integrand), id(test), id(quadrature), id(domain), tuple(field_ids))
+
+
 def make_sumfac_side_plan(
     integrand,
     arguments,
@@ -353,16 +664,30 @@ def make_sumfac_side_plan(
     quadrature: Quadrature,
     domain: GeometryDomain,
 ) -> SumfacSidePlan:
-    """Build the side launch plan and substitute the seed/injected fields in ``arguments``.
+    """Build (or fetch from cache) the side launch plan and substitute the stand-in fields in ``arguments``.
 
     On success, ``arguments.field_args`` is mutated in place: the test field
-    is replaced by a :class:`warp._src.fem.field.SideSeedField` and the input
-    trace field by a :class:`warp._src.fem.field.SideTraceInjectedField`, so
+    is replaced by a :class:`warp._src.fem.field.SideSeedField`, the input
+    trace field by a :class:`warp._src.fem.field.SideTraceInjectedField`, and
+    the ``Domain`` argument by a :class:`SideConstantGeometryDomain`, so
     that the downstream ``FieldStruct`` / ``IntegrandTransformer`` machinery
     generates the in-kernel Q-function. Raises
     :class:`SumfacNotApplicableError` if the form does not qualify (the
-    layout is validated before any mutation of ``arguments``).
+    layout is validated before any mutation of ``arguments``). Plans are
+    cached on the identity of the argument objects (with traced input fields
+    keyed by their underlying cell field, so the usual
+    ``fields={"u": u.trace(), ...}``-per-apply pattern hits the cache).
     """
+    cache_key = _side_plan_cache_key(integrand, arguments, test, quadrature, domain)
+    cached = _side_plan_cache.get(cache_key)
+    if cached is not None:
+        plan = cached[0]
+        arguments.field_args[plan.test_name] = plan.seed_field
+        arguments.field_args[plan.input_name] = plan.injected_field
+        if arguments.domain_name is not None:
+            arguments.field_args[arguments.domain_name] = plan.injected_domain
+        return plan
+
     layout = find_sumfac_side_layout(integrand, arguments, test, quadrature, domain)
 
     n, q = layout.n, layout.q
@@ -388,7 +713,15 @@ def make_sumfac_side_plan(
     arguments.field_args[arguments.test_name] = seed_field
     arguments.field_args[layout.input_name] = injected_field
 
-    return SumfacSidePlan(
+    # Substitute the integrand's Domain argument with the side-constant
+    # geometry stand-in: the kernel evaluates normal/measure/measure_ratio
+    # once per face and injects them into the channel evaluations instead of
+    # re-running the grid side decode inside every seeded integrand call.
+    injected_domain = SideConstantGeometryDomain(domain)
+    if arguments.domain_name is not None:
+        arguments.field_args[arguments.domain_name] = injected_domain
+
+    plan = SumfacSidePlan(
         test=test,
         test_name=arguments.test_name,
         input_name=layout.input_name,
@@ -396,6 +729,7 @@ def make_sumfac_side_plan(
         cell_field=layout.input_field.cell_field,
         seed_field=seed_field,
         injected_field=injected_field,
+        injected_domain=injected_domain,
         degree=layout.degree,
         n=n,
         q=q,
@@ -403,7 +737,12 @@ def make_sumfac_side_plan(
         test_uses_grad=layout.test_uses_grad,
         end_ops=end_ops,
         tang_ops=tang_ops,
+        end_ops_t=np.ascontiguousarray(end_ops.T),
+        tang_ops_t=np.ascontiguousarray(tang_ops.T),
     )
+    # Pin the id()-keyed objects alongside the plan (see _side_plan_cache).
+    _side_plan_cache[cache_key] = (plan, (integrand, test, quadrature, domain))
+    return plan
 
 
 # -- Cell-to-side gather map ----------------------------------------------------
@@ -526,6 +865,7 @@ def get_integrate_side_sumfac_kernel(
     dim: int,
     test_uses_grad: bool,
     accumulate_dtype,
+    injected_domain: SideConstantGeometryDomain,
 ):
     """Build the fused gather-formulation side kernel body for a qualifying linear form.
 
@@ -536,9 +876,54 @@ def get_integrate_side_sumfac_kernel(
     code transformers, exactly like the volume linear factory.
 
     The kernel is launched with ``wp.launch_tiled(dim=[active_cell_count])``,
-    one cell per block; per-face control flow is uniform over the block (faces
-    outside the integration domain contribute zero through their role
-    weights, never through divergent tile operations).
+    one cell per block. Per cell it runs one *dynamic* loop over the ``dim``
+    element axes (the runtime ``two`` argument keeps every loop bound
+    runtime-valued so tile temporaries are emitted -- and their shared memory
+    allocated -- once instead of per unrolled iteration); each iteration
+    processes the cell's two opposing faces along that axis with *stacked*
+    operators (the perf-round redesign; see
+    ``design/sumfac-phase6-perf-analysis.md``):
+
+    1. **B stage** -- the endpoint value and derivative rows of *both*
+       opposing faces form the single ``(4, n)`` ``end_ops`` operator, applied
+       to the concatenation ``[own | neighbor(end 0) | neighbor(end 1)]`` of
+       the axis-major element DOF tensors in one GEMM (the own-cell tensor is
+       loaded once per cell). One further GEMM against the stacked
+       ``(n, 4q)`` transposed tangential operator (interpolation, derivative,
+       and their longitude-flipped variants) yields every trace channel of
+       every face/neighbor at the side quadrature points; the per-face flip
+       and inner/outer role pick rows/columns at read time.
+    2. **D stage** -- per face quadrature point, the transformed integrand is
+       evaluated with the test field replaced by a
+       :class:`warp._src.fem.field.SideSeedField`, the input field by a
+       :class:`warp._src.fem.field.SideTraceInjectedField` filled from the
+       B-stage trace tile, and the ``Domain`` argument by a
+       :class:`SideConstantGeometryDomain` whose normal/measure/measure-ratio
+       members are evaluated ONCE per face (they are side constants on grids)
+       instead of re-decoded inside every seeded evaluation; the inverse cell
+       Jacobians and the side measure used for the quadrature scale are
+       hoisted per face the same way. Faces outside the integration domain
+       are skipped with block-uniform branches (axis level and face level)
+       rather than computed-and-zeroed. The extracted test-channel
+       coefficients are written into a flip-*padded* coefficient tile (each
+       face's block sits at its flip's column/row offset, the other variant's
+       half stays zero).
+    3. **B^T stage** -- the padded layout lets both faces of the axis lift
+       through shared operands: one GEMM against the full tangential operator
+       and one against the ``(n, 4)`` transposed endpoint operator accumulate
+       the axis residual (the zero pad halves absorb the per-face flip
+       selection without per-face GEMMs).
+
+    This brings the per-cell ``tile_matmul`` count from 24 to 8 in 2D (and
+    from ~100 to ~21 in 3D) with identical math per coefficient -- only
+    floating-point summation order changes (well inside the 1e-9 oracle
+    tolerance of the side-apply tests).
+
+    Tile-view discipline: NO ``tile_view`` result is ever passed to
+    ``tile_matmul`` (the known cuBLASDx strided-operand hazard -- see
+    ``design/sumfac-status.md``). Views appear only as ``tile_assign``
+    sources (element-wise copies, stride-safe) and as full-width row blocks
+    reshaped for assignment; every GEMM operand is an owned, contiguous tile.
 
     Args:
         integrand_func: Transformed integrand (with the seed/injected fields
@@ -560,13 +945,19 @@ def get_integrate_side_sumfac_kernel(
             the test field; when ``False`` the gradient seeds are omitted.
         accumulate_dtype: Scalar type used for the tile contractions and
             coefficient accumulation.
+        injected_domain: The :class:`SideConstantGeometryDomain` standing in
+            for the integrand's ``Domain`` argument; provides the per-face
+            injected ``ElementArg``.
     """
     geometry = domain.geometry
     space = test.space
     SampleType = geometry.sample_type
+    scalar_type = geometry.scalar_type
+    coords_type = cached_coords_type(scalar_type)
     value_type = injected_field.dtype
     grad_type = injected_field.gradient_dtype
     InjectedEvalArg = injected_field.EvalArg
+    InjectedGeoArg = injected_domain.ElementArg
 
     inner_grad_transform = space.element_inner_reference_gradient_transform
     outer_grad_transform = space.element_outer_reference_gradient_transform
@@ -574,23 +965,19 @@ def get_integrate_side_sumfac_kernel(
     OUTER_VALUE_SEED = wp.constant(1 + dim)
     OUTER_GRAD_BEGIN = wp.constant(2 + dim)
 
-    face_count = 2 * dim
-    meta_int_vec = cache.cached_vec_type(length=face_count, dtype=int)
-    meta_scalar_vec = cache.cached_vec_type(length=face_count, dtype=accumulate_dtype)
+    meta_int2 = cache.cached_vec_type(length=2, dtype=int)
+    meta_scalar2 = cache.cached_vec_type(length=2, dtype=accumulate_dtype)
     acc_grad_vec = cache.cached_vec_type(length=dim, dtype=accumulate_dtype)
 
     n_c = wp.constant(n)
     q_c = wp.constant(q)
     q2_c = wp.constant(2 * q)
+    q3_c = wp.constant(3 * q)
+    q4_c = wp.constant(4 * q)
     nn_c = wp.constant(n * n)
+    n3_c = wp.constant(3 * n)
 
     if dim == 2:
-        # Tile row layouts (2D): TR holds 6 trace channels per face
-        # [u_in, du_in/dn(ref), du_in/dt(ref), u_out, du_out/dn, du_out/dt];
-        # CF holds the 2 lift rows per face [[c0 | c_tang], [c_norm | 0]].
-        tr_rows_c = wp.constant(4 * 6)
-        cf_rows_c = wp.constant(4 * 2)
-        dloop_c = wp.constant(4 * q)
 
         def integrate_kernel_fn(
             qp_arg: quadrature.Arg,
@@ -600,233 +987,287 @@ def get_integrate_side_sumfac_kernel(
             values: ValueStruct,
             input_eval_arg: cell_field.EvalArg,
             end_ops: wp.array2d(dtype=accumulate_dtype),
+            end_ops_t: wp.array2d(dtype=accumulate_dtype),
             tang_ops: wp.array2d(dtype=accumulate_dtype),
+            tang_ops_t: wp.array2d(dtype=accumulate_dtype),
             face_map: wp.array2d(dtype=int),
             active_cells: wp.array(dtype=int),
+            two: int,
             result_elem: wp.array2d(dtype=accumulate_dtype),
         ):
             block_index = wp.tid()
             cell_index = active_cells[block_index]
 
-            # Runtime-valued loop bound (always 2): keeps the face/neighbor
-            # loops dynamic so their tile temporaries are emitted (and their
-            # shared memory allocated) once instead of per unrolled iteration.
-            dyn2 = wp.min(2, cell_index + 2)
+            E_all = wp.tile_load(end_ops, shape=(4, n_c))  # rows [v(e0); d(e0); v(e1); d(e1)]
+            Et_all = wp.tile_load(end_ops_t, shape=(n_c, 4))
+            W_all = wp.tile_load(tang_ops, shape=(q4_c, n_c))  # rows [interp; deriv; interp_f; deriv_f]
+            Wt_all = wp.tile_load(tang_ops_t, shape=(n_c, q4_c))
 
-            # Per-face metadata recorded by the B stage for the D and B^T stages
-            dse_v = meta_int_vec()
-            side_v = meta_int_vec()
-            flip_v = meta_int_vec()
-            w_in_v = meta_scalar_vec()
-            w_out_v = meta_scalar_vec()
+            # Own-cell DOF tensor, loaded ONCE per cell
+            u_own_flat = wp.tile_load(input_eval_arg.dof_values, shape=(nn_c,), offset=(cell_index * nn_c,))
+            U_own = wp.tile_astype(wp.tile_reshape(u_own_flat, shape=(n_c, n_c)), dtype=accumulate_dtype)
 
-            TR = wp.tile_zeros(shape=(tr_rows_c, q_c), dtype=accumulate_dtype)
-            CF = wp.tile_zeros(shape=(cf_rows_c, q2_c), dtype=accumulate_dtype)
-
-            # --- B stage, axis 0 faces (normal along element axis 0) -------
-            for end in range(dyn2):
-                face = end
-                dse_raw = face_map[cell_index, face]
-                active = dse_raw >= 0
-                dse = wp.max(dse_raw, 0)
-                side_index = domain.element_index(domain_index_arg, dse)
-                inner_cell = geometry.side_inner_cell_index(domain_arg, side_index)
-                outer_cell = geometry.side_outer_cell_index(domain_arg, side_index)
-                boundary = inner_cell == outer_cell
-                alt0 = boundary and end == 0
-                inner_end = wp.where(alt0, 0, 1)
-                outer_end = wp.where(boundary and end == 1, 1, 0)
-                # 2D longitude flip: (axis == 0) == (altitude == 0)
-                flip = wp.where(alt0, 1, 0)
-
-                dse_v[face] = dse
-                side_v[face] = side_index
-                flip_v[face] = flip
-                w_in_v[face] = wp.where(
-                    active and inner_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0)
-                )
-                w_out_v[face] = wp.where(
-                    active and outer_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0)
-                )
-
-                W_x0 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip * q2_c, 0))
-                for nb in range(dyn2):
-                    nb_cell = wp.where(nb == 0, inner_cell, outer_cell)
-                    nb_end = wp.where(nb == 0, inner_end, outer_end)
-                    u_flat_x0 = wp.tile_load(input_eval_arg.dof_values, shape=(nn_c,), offset=(nb_cell * nn_c,))
-                    U_x0 = wp.tile_astype(wp.tile_reshape(u_flat_x0, shape=(n_c, n_c)), dtype=accumulate_dtype)
-                    E_nb_x0 = wp.tile_load(end_ops, shape=(2, n_c), offset=(2 * nb_end, 0))
-                    T_x0 = wp.tile_matmul(E_nb_x0, U_x0)  # (2, n): [value; d/dn] face nodal
-                    V_x0 = wp.tile_matmul(T_x0, wp.tile_transpose(W_x0))  # (2, 2q)
-                    for rr in range(q_c):
-                        TR[face * 6 + nb * 3 + 0, rr] = V_x0[0, rr]
-                        TR[face * 6 + nb * 3 + 1, rr] = V_x0[1, rr]
-                        TR[face * 6 + nb * 3 + 2, rr] = V_x0[0, q_c + rr]
-
-            # --- B stage, axis 1 faces --------------------------------------
-            for end in range(dyn2):
-                face = 2 + end
-                dse_raw = face_map[cell_index, face]
-                active = dse_raw >= 0
-                dse = wp.max(dse_raw, 0)
-                side_index = domain.element_index(domain_index_arg, dse)
-                inner_cell = geometry.side_inner_cell_index(domain_arg, side_index)
-                outer_cell = geometry.side_outer_cell_index(domain_arg, side_index)
-                boundary = inner_cell == outer_cell
-                alt0 = boundary and end == 0
-                inner_end = wp.where(alt0, 0, 1)
-                outer_end = wp.where(boundary and end == 1, 1, 0)
-                # 2D longitude flip: (axis == 0) == (altitude == 0)
-                flip = wp.where(alt0, 0, 1)
-
-                dse_v[face] = dse
-                side_v[face] = side_index
-                flip_v[face] = flip
-                w_in_v[face] = wp.where(
-                    active and inner_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0)
-                )
-                w_out_v[face] = wp.where(
-                    active and outer_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0)
-                )
-
-                W_x1 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip * q2_c, 0))
-                for nb in range(dyn2):
-                    nb_cell = wp.where(nb == 0, inner_cell, outer_cell)
-                    nb_end = wp.where(nb == 0, inner_end, outer_end)
-                    u_flat_x1 = wp.tile_load(input_eval_arg.dof_values, shape=(nn_c,), offset=(nb_cell * nn_c,))
-                    U_x1 = wp.tile_astype(wp.tile_reshape(u_flat_x1, shape=(n_c, n_c)), dtype=accumulate_dtype)
-                    E_nb_x1 = wp.tile_load(end_ops, shape=(2, n_c), offset=(2 * nb_end, 0))
-                    T_x1 = wp.tile_matmul(E_nb_x1, wp.tile_transpose(U_x1))  # (2, n): face frame = axis 0
-                    V_x1 = wp.tile_matmul(T_x1, wp.tile_transpose(W_x1))  # (2, 2q)
-                    for rr in range(q_c):
-                        TR[face * 6 + nb * 3 + 0, rr] = V_x1[0, rr]
-                        TR[face * 6 + nb * 3 + 1, rr] = V_x1[1, rr]
-                        TR[face * 6 + nb * 3 + 2, rr] = V_x1[0, q_c + rr]
-
-            # --- D stage: seeded integrand evaluations per face quadrature point
-            qp_fields = FieldStruct()
-            _copy_qp_fields()
-
-            for it in range(dloop_c):
-                face = it // q_c
-                r = it - face * q_c
-                axis = face // 2
-                tang_axis = 1 - axis
-                dse = dse_v[face]
-                side_index = side_v[face]
-                w_in = w_in_v[face]
-                w_out = w_out_v[face]
-
-                qp_index = quadrature.point_index(domain_arg, qp_arg, dse, side_index, r)
-                qp_coords = quadrature.point_coords(domain_arg, qp_arg, dse, side_index, r)
-                qp_weight = quadrature.point_weight(domain_arg, qp_arg, dse, side_index, r)
-
-                free_sample = make_free_sample(side_index, qp_coords)
-                vol = domain.element_measure(domain_arg, free_sample)
-                scale = accumulate_dtype(qp_weight * vol)
-                xf_in = inner_grad_transform(domain_arg, free_sample)  # J^{-1} of the inner cell
-                xf_out = outer_grad_transform(domain_arg, free_sample)
-
-                # Inject the B-stage traces (value + physical gradient, inner and outer)
-                base = face * 6
-                inj_arg = InjectedEvalArg()
-                inj_arg.inner_value = value_type(TR[base + 0, r])
-                g_in = grad_type()
-                g_in[axis] = value_type(TR[base + 1, r])
-                g_in[tang_axis] = value_type(TR[base + 2, r])
-                inj_arg.inner_gradient = wp.transpose(xf_in) * g_in
-                inj_arg.outer_value = value_type(TR[base + 3, r])
-                g_out = grad_type()
-                g_out[axis] = value_type(TR[base + 4, r])
-                g_out[tang_axis] = value_type(TR[base + 5, r])
-                inj_arg.outer_gradient = wp.transpose(xf_out) * g_out
-                _set_injected_eval_arg()
-
-                # Seeded test-channel extraction; this cell lifts its own
-                # role's channels (both roles on boundary sides).
-                c0 = accumulate_dtype(0.0)
-                cg = acc_grad_vec()
-                if w_in != accumulate_dtype(0.0):
-                    sample = SampleType(side_index, qp_coords, qp_index, qp_weight, DofIndex(0, 0), NULL_DOF_INDEX)
-                    c0 += w_in * accumulate_dtype(integrand_func(sample, qp_fields, values))
-                    if wp.static(test_uses_grad):
-                        fg = grad_type()
-                        for seed in range(2):
-                            sample = SampleType(
-                                side_index, qp_coords, qp_index, qp_weight, DofIndex(seed + 1, 0), NULL_DOF_INDEX
-                            )
-                            fg[seed] = value_type(integrand_func(sample, qp_fields, values))
-                        fg_ref = xf_in * fg
-                        for k in range(2):
-                            cg[k] += w_in * accumulate_dtype(fg_ref[k])
-                if w_out != accumulate_dtype(0.0):
-                    sample = SampleType(
-                        side_index, qp_coords, qp_index, qp_weight, DofIndex(OUTER_VALUE_SEED, 0), NULL_DOF_INDEX
-                    )
-                    c0 += w_out * accumulate_dtype(integrand_func(sample, qp_fields, values))
-                    if wp.static(test_uses_grad):
-                        fg = grad_type()
-                        for seed in range(2):
-                            sample = SampleType(
-                                side_index,
-                                qp_coords,
-                                qp_index,
-                                qp_weight,
-                                DofIndex(OUTER_GRAD_BEGIN + seed, 0),
-                                NULL_DOF_INDEX,
-                            )
-                            fg[seed] = value_type(integrand_func(sample, qp_fields, values))
-                        fg_ref = xf_out * fg
-                        for k in range(2):
-                            cg[k] += w_out * accumulate_dtype(fg_ref[k])
-
-                CF[face * 2 + 0, r] = scale * c0
-                if wp.static(test_uses_grad):
-                    CF[face * 2 + 0, q_c + r] = scale * cg[tang_axis]
-                    CF[face * 2 + 1, r] = scale * cg[axis]
-
-            # --- B^T stage: lift the coefficients back to cell nodal residuals
             r_a = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)  # axis-0 faces: [i, j]
             r_b = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)  # axis-1 faces: [j, i]
 
-            for end in range(dyn2):
-                E_own = wp.tile_load(end_ops, shape=(2, n_c), offset=(2 * end, 0))
-                # axis 0 face
-                face = end
-                W0 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip_v[face] * q2_c, 0))
-                Ff0 = wp.tile_view(CF, offset=(face * 2, 0), shape=(2, q2_c))
-                X0 = wp.tile_matmul(wp.tile_transpose(E_own), Ff0)  # (n, 2q)
-                wp.tile_matmul(X0, W0, r_a)
-                # axis 1 face
-                face = 2 + end
-                W1 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip_v[face] * q2_c, 0))
-                Ff1 = wp.tile_view(CF, offset=(face * 2, 0), shape=(2, q2_c))
-                X1 = wp.tile_matmul(wp.tile_transpose(E_own), Ff1)  # (n, 2q)
-                wp.tile_matmul(X1, W1, r_b)
+            qp_fields = FieldStruct()
+            _copy_qp_fields()
 
-            # Combine the two face orientations: r[i, j] = r_a[i, j] + r_b[j, i]
+            # Injected domain arg: side-constant geometry (normal, measure,
+            # measure ratio) is evaluated once per face below and read by the
+            # integrand through the SideConstantGeometryDomain stand-in.
+            qp_domain_geo = InjectedGeoArg()
+            qp_domain_geo.base = domain_arg
+            face_center = coords_type(scalar_type(0.5), scalar_type(0.5), scalar_type(0.0))
+
+            # Dynamic axis loop (runtime bound): tile temporaries below are
+            # emitted/allocated once, not per unrolled iteration.
+            for axis in range(two):
+                # ---- per-face metadata (block-uniform scalars) ------------
+                dse2 = meta_int2()
+                side2 = meta_int2()
+                nbend2 = meta_int2()
+                flip2 = meta_int2()
+                bnd2 = meta_int2()
+                w_in2 = meta_scalar2()
+                w_out2 = meta_scalar2()
+
+                # face end 0 (own cell is the side's outer cell on interior sides)
+                dse_raw0 = face_map[cell_index, 2 * axis + 0]
+                active0 = dse_raw0 >= 0
+                dse0 = wp.max(dse_raw0, 0)
+                side_index0 = domain.element_index(domain_index_arg, dse0)
+                in_c0 = geometry.side_inner_cell_index(domain_arg, side_index0)
+                out_c0 = geometry.side_outer_cell_index(domain_arg, side_index0)
+                boundary0 = in_c0 == out_c0
+                nb_cell0 = in_c0  # == cell_index on boundary sides
+                dse2[0] = dse0
+                side2[0] = side_index0
+                nbend2[0] = wp.where(boundary0, 0, 1)
+                bnd2[0] = wp.where(boundary0, 1, 0)
+                # 2D longitude flip: (axis == 0) == (altitude == 0)
+                flip2[0] = wp.where(axis == 0, wp.where(boundary0, 1, 0), wp.where(boundary0, 0, 1))
+                w_in2[0] = wp.where(active0 and boundary0, accumulate_dtype(1.0), accumulate_dtype(0.0))
+                w_out2[0] = wp.where(active0, accumulate_dtype(1.0), accumulate_dtype(0.0))
+
+                # face end 1 (own cell is the side's inner cell on interior sides)
+                dse_raw1 = face_map[cell_index, 2 * axis + 1]
+                active1 = dse_raw1 >= 0
+                dse1 = wp.max(dse_raw1, 0)
+                side_index1 = domain.element_index(domain_index_arg, dse1)
+                in_c1 = geometry.side_inner_cell_index(domain_arg, side_index1)
+                out_c1 = geometry.side_outer_cell_index(domain_arg, side_index1)
+                boundary1 = in_c1 == out_c1
+                nb_cell1 = out_c1
+                dse2[1] = dse1
+                side2[1] = side_index1
+                nbend2[1] = wp.where(boundary1, 1, 0)
+                bnd2[1] = wp.where(boundary1, 1, 0)
+                flip2[1] = wp.where(axis == 0, 0, 1)
+                w_in2[1] = wp.where(active1, accumulate_dtype(1.0), accumulate_dtype(0.0))
+                w_out2[1] = wp.where(active1 and boundary1, accumulate_dtype(1.0), accumulate_dtype(0.0))
+
+                act0 = wp.where(active0, 1, 0)
+                act1 = wp.where(active1, 1, 0)
+
+                # Skip the whole axis when neither face belongs to the
+                # integration domain (block-uniform branch; e.g. on
+                # BoundarySides most of a boundary cell's faces are inactive).
+                if active0 or active1:
+                    # Hoisted side-constant geometry (constant per side on the
+                    # qualifying grid geometries): normal, side measure,
+                    # measure ratio, and the inverse cell Jacobians.
+                    fs0 = make_free_sample(side_index0, face_center)
+                    nor0 = domain.element_normal(domain_arg, fs0)
+                    meas0 = domain.element_measure(domain_arg, fs0)
+                    ratio0 = domain.element_measure_ratio(domain_arg, fs0)
+                    xf_in0 = inner_grad_transform(domain_arg, fs0)
+                    xf_out0 = outer_grad_transform(domain_arg, fs0)
+                    fs1 = make_free_sample(side_index1, face_center)
+                    nor1 = domain.element_normal(domain_arg, fs1)
+                    meas1 = domain.element_measure(domain_arg, fs1)
+                    ratio1 = domain.element_measure_ratio(domain_arg, fs1)
+                    xf_in1 = inner_grad_transform(domain_arg, fs1)
+                    xf_out1 = outer_grad_transform(domain_arg, fs1)
+
+                    # ---- B stage: stacked endpoint + tangential contractions ---
+                    # U_cat = [own | nb(end 0) | nb(end 1)] in axis-major layout
+                    # (the tangential node axis is the column axis of each block).
+                    U_cat = wp.tile_zeros(shape=(n_c, n3_c), dtype=accumulate_dtype)
+                    nb0_flat = wp.tile_load(input_eval_arg.dof_values, shape=(nn_c,), offset=(nb_cell0 * nn_c,))
+                    NB0 = wp.tile_astype(wp.tile_reshape(nb0_flat, shape=(n_c, n_c)), dtype=accumulate_dtype)
+                    nb1_flat = wp.tile_load(input_eval_arg.dof_values, shape=(nn_c,), offset=(nb_cell1 * nn_c,))
+                    NB1 = wp.tile_astype(wp.tile_reshape(nb1_flat, shape=(n_c, n_c)), dtype=accumulate_dtype)
+                    if axis == 0:
+                        wp.tile_assign(U_cat, U_own, offset=(0, 0))
+                        wp.tile_assign(U_cat, NB0, offset=(0, n_c))
+                        wp.tile_assign(U_cat, NB1, offset=(0, 2 * n_c))
+                    else:
+                        wp.tile_assign(U_cat, wp.tile_transpose(U_own), offset=(0, 0))
+                        wp.tile_assign(U_cat, wp.tile_transpose(NB0), offset=(0, n_c))
+                        wp.tile_assign(U_cat, wp.tile_transpose(NB1), offset=(0, 2 * n_c))
+
+                    # Endpoint traces of all three tensors at BOTH ends in one GEMM
+                    T = wp.tile_matmul(E_all, U_cat)  # (4, 3n)
+
+                    # Restack per-tensor column blocks into rows for the shared
+                    # tangential GEMM (tile_assign accepts the strided views).
+                    TS = wp.tile_zeros(shape=(12, n_c), dtype=accumulate_dtype)
+                    for b in range(3):
+                        wp.tile_assign(TS, wp.tile_view(T, offset=(0, b * n_c), shape=(4, n_c)), offset=(4 * b, 0))
+
+                    # Every trace channel at the side QPs, both flip variants:
+                    # rows = [own; nb0; nb1] x [v(e0); d(e0); v(e1); d(e1)],
+                    # cols = [interp; deriv; interp_f; deriv_f] blocks of q.
+                    V = wp.tile_matmul(TS, Wt_all)  # (12, 4q)
+
+                    # ---- D stage: seeded integrand evaluations per face QP -----
+                    # Flip-padded coefficient tile: rows [c0|ct (end 0); cn (end 0);
+                    # c0|ct (end 1); cn (end 1)], each face's block at its flip's
+                    # column offset (the other half stays zero).
+                    CF = wp.tile_zeros(shape=(4, q4_c), dtype=accumulate_dtype)
+
+                    for it in range(two * q_c):
+                        e = it // q_c
+                        r = it - e * q_c
+                        # Skip faces outside the integration domain entirely
+                        # (block-uniform branch).
+                        active_f = wp.where(e == 0, act0, act1)
+                        if active_f == 1:
+                            tang_axis = 1 - axis
+                            dse = dse2[e]
+                            side_index = side2[e]
+                            w_in = w_in2[e]
+                            w_out = w_out2[e]
+                            col = flip2[e] * q2_c
+
+                            qp_index = quadrature.point_index(domain_arg, qp_arg, dse, side_index, r)
+                            qp_coords = quadrature.point_coords(domain_arg, qp_arg, dse, side_index, r)
+                            qp_weight = quadrature.point_weight(domain_arg, qp_arg, dse, side_index, r)
+
+                            # Per-face hoisted geometry (side constants on grids)
+                            meas = wp.where(e == 0, meas0, meas1)
+                            scale = accumulate_dtype(qp_weight * meas)
+                            xf_in = wp.where(e == 0, xf_in0, xf_in1)  # J^{-1} of the inner cell
+                            xf_out = wp.where(e == 0, xf_out0, xf_out1)
+                            qp_domain_geo.normal = wp.where(e == 0, nor0, nor1)
+                            qp_domain_geo.measure = meas
+                            qp_domain_geo.measure_ratio = wp.where(e == 0, ratio0, ratio1)
+
+                            # Trace-tile rows of this face's inner/outer roles
+                            own_v = 2 * e
+                            nb_v = 4 + 4 * e + 2 * nbend2[e]
+                            own_role_inner = bnd2[e] == 1 or e == 1
+                            in_v = wp.where(own_role_inner, own_v, nb_v)
+                            out_v = wp.where(bnd2[e] == 1 or e == 0, own_v, nb_v)
+
+                            # Inject the B-stage traces (value + physical gradient, inner and outer)
+                            inj_arg = InjectedEvalArg()
+                            inj_arg.inner_value = value_type(V[in_v, col + r])
+                            g_in = grad_type()
+                            g_in[axis] = value_type(V[in_v + 1, col + r])
+                            g_in[tang_axis] = value_type(V[in_v, col + q_c + r])
+                            inj_arg.inner_gradient = wp.transpose(xf_in) * g_in
+                            inj_arg.outer_value = value_type(V[out_v, col + r])
+                            g_out = grad_type()
+                            g_out[axis] = value_type(V[out_v + 1, col + r])
+                            g_out[tang_axis] = value_type(V[out_v, col + q_c + r])
+                            inj_arg.outer_gradient = wp.transpose(xf_out) * g_out
+                            _set_injected_eval_arg()
+
+                            # Seeded test-channel extraction; this cell lifts its own
+                            # role's channels (both roles on boundary sides).
+                            c0 = accumulate_dtype(0.0)
+                            cg = acc_grad_vec()
+                            if w_in != accumulate_dtype(0.0):
+                                sample = SampleType(
+                                    side_index, qp_coords, qp_index, qp_weight, DofIndex(0, 0), NULL_DOF_INDEX
+                                )
+                                c0 += w_in * accumulate_dtype(integrand_func(sample, qp_fields, values))
+                                if wp.static(test_uses_grad):
+                                    fg = grad_type()
+                                    for seed in range(2):
+                                        sample = SampleType(
+                                            side_index,
+                                            qp_coords,
+                                            qp_index,
+                                            qp_weight,
+                                            DofIndex(seed + 1, 0),
+                                            NULL_DOF_INDEX,
+                                        )
+                                        fg[seed] = value_type(integrand_func(sample, qp_fields, values))
+                                    fg_ref = xf_in * fg
+                                    for k in range(2):
+                                        cg[k] += w_in * accumulate_dtype(fg_ref[k])
+                            if w_out != accumulate_dtype(0.0):
+                                sample = SampleType(
+                                    side_index,
+                                    qp_coords,
+                                    qp_index,
+                                    qp_weight,
+                                    DofIndex(OUTER_VALUE_SEED, 0),
+                                    NULL_DOF_INDEX,
+                                )
+                                c0 += w_out * accumulate_dtype(integrand_func(sample, qp_fields, values))
+                                if wp.static(test_uses_grad):
+                                    fg = grad_type()
+                                    for seed in range(2):
+                                        sample = SampleType(
+                                            side_index,
+                                            qp_coords,
+                                            qp_index,
+                                            qp_weight,
+                                            DofIndex(OUTER_GRAD_BEGIN + seed, 0),
+                                            NULL_DOF_INDEX,
+                                        )
+                                        fg[seed] = value_type(integrand_func(sample, qp_fields, values))
+                                    fg_ref = xf_out * fg
+                                    for k in range(2):
+                                        cg[k] += w_out * accumulate_dtype(fg_ref[k])
+
+                            CF[2 * e, col + r] = scale * c0
+                            if wp.static(test_uses_grad):
+                                CF[2 * e, col + q_c + r] = scale * cg[tang_axis]
+                                CF[2 * e + 1, col + r] = scale * cg[axis]
+
+                    # ---- B^T stage: padded lift, both faces in two GEMMs -------
+                    Y = wp.tile_matmul(CF, W_all)  # (4, n): [c0-lift(e0); cn-lift(e0); c0-lift(e1); cn-lift(e1)]
+                    if axis == 0:
+                        wp.tile_matmul(Et_all, Y, r_a)
+                    else:
+                        wp.tile_matmul(Et_all, Y, r_b)
+
+            # Combine the two face orientations: r[i, j] = r_a[i, j] + r_b[j, i].
+            # Written into a FRESH tile: an in-place r_a update would be a
+            # read-modify-write on shared memory racing across the redundant
+            # per-thread element writes (one warp's store can land before
+            # another's load of the same element -- caught by racecheck).
+            r_c = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)
             for t in range(nn_c):
                 i = t // n_c
                 j = t - i * n_c
-                r_a[i, j] = r_a[i, j] + r_b[j, i]
+                r_c[i, j] = r_a[i, j] + r_b[j, i]
 
-            r_flat = wp.tile_reshape(r_a, shape=(1, nn_c))
+            r_flat = wp.tile_reshape(r_c, shape=(1, nn_c))
             wp.tile_store(result_elem, r_flat, offset=(block_index, 0))
 
         return integrate_kernel_fn
 
     # ----------------------------- 3D -------------------------------------
-    # Tile row layouts: TR holds 8 trace channels per face
-    # [u_in, du_in/dn, du_in/d(ga0), du_in/d(ga1), u_out, ...] at the qq side
-    # QPs in canonical order r = r0 * q + r1; CB holds the (2q, 2q) lift
-    # blocks [[C0, Ct_col], [Ct_row, 0]] per face in the face frame (rows =
-    # face-frame-first axis); CA the (q, q) normal-derivative coefficients.
+    # Same staged structure as 2D with rank-2 face tensors. Per axis the
+    # element DOF tensors are permuted to axis-major layout [a, rest]; the
+    # face frame is the SORTED pair of remaining axes (t1 < t2), so the side
+    # frame's cyclic order means: axis 0 -> (t1, t2) = (longitude, latitude),
+    # axis 1 -> (latitude, longitude) [swapped], axis 2 -> (longitude,
+    # latitude); the longitude flip applies to rows (t1) for axes 0/2 and to
+    # columns (t2) for axis 1, selected at runtime.
     nnn_c = wp.constant(n * n * n)
     qq_c = wp.constant(q * q)
-    tr_rows_c = wp.constant(6 * 8)
-    cb_rows_c = wp.constant(6 * 2 * q)
-    ca_rows_c = wp.constant(6 * q)
-    dloop_c = wp.constant(6 * q * q)
+    n12_c = wp.constant(12 * n)
+    q16_c = wp.constant(16 * q)
+    nn3_c = wp.constant(3 * n * n)
+    n4_c = wp.constant(4 * n)
+    q6_c = wp.constant(6 * q)
 
     def integrate_kernel_fn(
         qp_arg: quadrature.Arg,
@@ -836,348 +1277,361 @@ def get_integrate_side_sumfac_kernel(
         values: ValueStruct,
         input_eval_arg: cell_field.EvalArg,
         end_ops: wp.array2d(dtype=accumulate_dtype),
+        end_ops_t: wp.array2d(dtype=accumulate_dtype),
         tang_ops: wp.array2d(dtype=accumulate_dtype),
+        tang_ops_t: wp.array2d(dtype=accumulate_dtype),
         face_map: wp.array2d(dtype=int),
         active_cells: wp.array(dtype=int),
+        two: int,
         result_elem: wp.array2d(dtype=accumulate_dtype),
     ):
         block_index = wp.tid()
         cell_index = active_cells[block_index]
 
-        # Runtime-valued loop bound (always 2): keeps the face/neighbor loops
-        # dynamic so their tile temporaries are emitted once.
-        dyn2 = wp.min(2, cell_index + 2)
+        E_all = wp.tile_load(end_ops, shape=(4, n_c))  # rows [v(e0); d(e0); v(e1); d(e1)]
+        Et_all = wp.tile_load(end_ops_t, shape=(n_c, 4))
+        W_all = wp.tile_load(tang_ops, shape=(q4_c, n_c))  # rows [interp; deriv; interp_f; deriv_f]
+        Wt_all = wp.tile_load(tang_ops_t, shape=(n_c, q4_c))
 
-        dse_v = meta_int_vec()
-        side_v = meta_int_vec()
-        flip_v = meta_int_vec()
-        w_in_v = meta_scalar_vec()
-        w_out_v = meta_scalar_vec()
+        # Own-cell DOF tensor, loaded ONCE per cell, in all three axis-major
+        # layouts: rows [a*n : (a+1)*n] hold the [x_a, rest] layout.
+        u_own_flat = wp.tile_load(input_eval_arg.dof_values, shape=(nnn_c,), offset=(cell_index * nnn_c,))
+        U_own = wp.tile_astype(wp.tile_reshape(u_own_flat, shape=(n_c, nn_c)), dtype=accumulate_dtype)  # [i, jk]
+        OWN3 = wp.tile_zeros(shape=(n3_c, nn_c), dtype=accumulate_dtype)
+        wp.tile_assign(OWN3, U_own, offset=(0, 0))
+        for i in range(n_c):
+            wp.tile_assign(
+                OWN3,
+                wp.tile_reshape(wp.tile_view(U_own, offset=(i, 0), shape=(1, nn_c)), shape=(n_c, n_c)),
+                offset=(n_c, i * n_c),
+            )  # [j, ik]
+        wp.tile_assign(
+            OWN3, wp.tile_transpose(wp.tile_reshape(U_own, shape=(nn_c, n_c))), offset=(2 * n_c, 0)
+        )  # [k, ij]
 
-        TR = wp.tile_zeros(shape=(tr_rows_c, qq_c), dtype=accumulate_dtype)
-        CB = wp.tile_zeros(shape=(cb_rows_c, q2_c), dtype=accumulate_dtype)
-        CA = wp.tile_zeros(shape=(ca_rows_c, q_c), dtype=accumulate_dtype)
-
-        # --- B stage, axis 0 faces (face frame (1, 2) = (longitude, latitude))
-        for end in range(dyn2):
-            face = end
-            dse_raw = face_map[cell_index, face]
-            active = dse_raw >= 0
-            dse = wp.max(dse_raw, 0)
-            side_index = domain.element_index(domain_index_arg, dse)
-            inner_cell = geometry.side_inner_cell_index(domain_arg, side_index)
-            outer_cell = geometry.side_outer_cell_index(domain_arg, side_index)
-            boundary = inner_cell == outer_cell
-            alt0 = boundary and end == 0
-            inner_end = wp.where(alt0, 0, 1)
-            outer_end = wp.where(boundary and end == 1, 1, 0)
-            flip = wp.where(alt0, 1, 0)  # 3D longitude flip: altitude == 0
-
-            dse_v[face] = dse
-            side_v[face] = side_index
-            flip_v[face] = flip
-            w_in_v[face] = wp.where(active and inner_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0))
-            w_out_v[face] = wp.where(active and outer_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0))
-
-            # Face frame first axis = longitude (ga0 = 1), second = latitude (ga1 = 2)
-            S_row_x0 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip * q2_c, 0))
-            S_col_x0 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(0, 0))
-            I_row_x0 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(flip * q2_c, 0))
-            I_col_x0 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(0, 0))
-            for nb in range(dyn2):
-                nb_cell = wp.where(nb == 0, inner_cell, outer_cell)
-                nb_end = wp.where(nb == 0, inner_end, outer_end)
-                u_flat_x0 = wp.tile_load(input_eval_arg.dof_values, shape=(nnn_c,), offset=(nb_cell * nnn_c,))
-                U_x0 = wp.tile_astype(wp.tile_reshape(u_flat_x0, shape=(n_c, nn_c)), dtype=accumulate_dtype)  # [i, jk]
-                E_nb_x0 = wp.tile_load(end_ops, shape=(2, n_c), offset=(2 * nb_end, 0))
-                T_x0 = wp.tile_matmul(E_nb_x0, U_x0)  # (2, nn): [value; d/dn] over [j, k]
-                Fv_x0 = wp.tile_reshape(wp.tile_view(T_x0, offset=(0, 0), shape=(1, nn_c)), shape=(n_c, n_c))
-                Fg_x0 = wp.tile_reshape(wp.tile_view(T_x0, offset=(1, 0), shape=(1, nn_c)), shape=(n_c, n_c))
-                P_x0 = wp.tile_matmul(S_row_x0, Fv_x0)  # (2q, n)
-                Q_x0 = wp.tile_matmul(P_x0, wp.tile_transpose(S_col_x0))  # (2q, 2q)
-                G1_x0 = wp.tile_matmul(I_row_x0, Fg_x0)  # (q, n)
-                Gn_x0 = wp.tile_matmul(G1_x0, wp.tile_transpose(I_col_x0))  # (q, q)
-                for t in range(qq_c):
-                    r0 = t // q_c
-                    r1 = t - r0 * q_c
-                    TR[face * 8 + nb * 4 + 0, t] = Q_x0[r0, r1]
-                    TR[face * 8 + nb * 4 + 1, t] = Gn_x0[r0, r1]
-                    TR[face * 8 + nb * 4 + 2, t] = Q_x0[q_c + r0, r1]  # d/d ga0 (longitude)
-                    TR[face * 8 + nb * 4 + 3, t] = Q_x0[r0, q_c + r1]  # d/d ga1 (latitude)
-
-        # --- B stage, axis 1 faces (face frame (0, 2) = (latitude, longitude): swapped)
-        for end in range(dyn2):
-            face = 2 + end
-            dse_raw = face_map[cell_index, face]
-            active = dse_raw >= 0
-            dse = wp.max(dse_raw, 0)
-            side_index = domain.element_index(domain_index_arg, dse)
-            inner_cell = geometry.side_inner_cell_index(domain_arg, side_index)
-            outer_cell = geometry.side_outer_cell_index(domain_arg, side_index)
-            boundary = inner_cell == outer_cell
-            alt0 = boundary and end == 0
-            inner_end = wp.where(alt0, 0, 1)
-            outer_end = wp.where(boundary and end == 1, 1, 0)
-            flip = wp.where(alt0, 1, 0)
-
-            dse_v[face] = dse
-            side_v[face] = side_index
-            flip_v[face] = flip
-            w_in_v[face] = wp.where(active and inner_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0))
-            w_out_v[face] = wp.where(active and outer_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0))
-
-            # Face frame first axis = latitude (ga1 = 0, never flipped),
-            # second = longitude (ga0 = 2, flip-selected)
-            S_row_x1 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(0, 0))
-            S_col_x1 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip * q2_c, 0))
-            I_row_x1 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(0, 0))
-            I_col_x1 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(flip * q2_c, 0))
-            for nb in range(dyn2):
-                nb_cell = wp.where(nb == 0, inner_cell, outer_cell)
-                nb_end = wp.where(nb == 0, inner_end, outer_end)
-                u_flat_x1 = wp.tile_load(input_eval_arg.dof_values, shape=(nnn_c,), offset=(nb_cell * nnn_c,))
-                U_x1 = wp.tile_astype(wp.tile_reshape(u_flat_x1, shape=(n_c, nn_c)), dtype=accumulate_dtype)  # [i, jk]
-                E_nb_x1 = wp.tile_load(end_ops, shape=(2, n_c), offset=(2 * nb_end, 0))
-                # Slab contraction over the middle axis j: Fv_x1/Fg_x1 in face frame [i, k]
-                Fv_x1 = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)
-                Fg_x1 = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)
-                for i in range(n_c):
-                    blk_x1 = wp.tile_reshape(
-                        wp.tile_view(U_x1, offset=(i, 0), shape=(1, nn_c)), shape=(n_c, n_c)
-                    )  # [j, k]
-                    Ti_x1 = wp.tile_matmul(E_nb_x1, blk_x1)  # (2, n): [value; d/dn] over [k]
-                    wp.tile_assign(Fv_x1, wp.tile_view(Ti_x1, offset=(0, 0), shape=(1, n_c)), offset=(i, 0))
-                    wp.tile_assign(Fg_x1, wp.tile_view(Ti_x1, offset=(1, 0), shape=(1, n_c)), offset=(i, 0))
-                P_x1 = wp.tile_matmul(S_row_x1, Fv_x1)  # (2q, n): latitude rows
-                Q_x1 = wp.tile_matmul(P_x1, wp.tile_transpose(S_col_x1))  # (2q, 2q): [r1-blocks, r0-blocks]
-                G1_x1 = wp.tile_matmul(I_row_x1, Fg_x1)
-                Gn_x1 = wp.tile_matmul(G1_x1, wp.tile_transpose(I_col_x1))  # [r1, r0]
-                for t in range(qq_c):
-                    r0 = t // q_c
-                    r1 = t - r0 * q_c
-                    TR[face * 8 + nb * 4 + 0, t] = Q_x1[r1, r0]
-                    TR[face * 8 + nb * 4 + 1, t] = Gn_x1[r1, r0]
-                    TR[face * 8 + nb * 4 + 2, t] = Q_x1[r1, q_c + r0]  # d/d ga0 (longitude)
-                    TR[face * 8 + nb * 4 + 3, t] = Q_x1[q_c + r1, r0]  # d/d ga1 (latitude)
-
-        # --- B stage, axis 2 faces (face frame (0, 1) = (longitude, latitude))
-        for end in range(dyn2):
-            face = 4 + end
-            dse_raw = face_map[cell_index, face]
-            active = dse_raw >= 0
-            dse = wp.max(dse_raw, 0)
-            side_index = domain.element_index(domain_index_arg, dse)
-            inner_cell = geometry.side_inner_cell_index(domain_arg, side_index)
-            outer_cell = geometry.side_outer_cell_index(domain_arg, side_index)
-            boundary = inner_cell == outer_cell
-            alt0 = boundary and end == 0
-            inner_end = wp.where(alt0, 0, 1)
-            outer_end = wp.where(boundary and end == 1, 1, 0)
-            flip = wp.where(alt0, 1, 0)
-
-            dse_v[face] = dse
-            side_v[face] = side_index
-            flip_v[face] = flip
-            w_in_v[face] = wp.where(active and inner_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0))
-            w_out_v[face] = wp.where(active and outer_cell == cell_index, accumulate_dtype(1.0), accumulate_dtype(0.0))
-
-            # Face frame first axis = longitude (ga0 = 0), second = latitude (ga1 = 1)
-            S_row_x2 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip * q2_c, 0))
-            S_col_x2 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(0, 0))
-            I_row_x2 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(flip * q2_c, 0))
-            I_col_x2 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(0, 0))
-            for nb in range(dyn2):
-                nb_cell = wp.where(nb == 0, inner_cell, outer_cell)
-                nb_end = wp.where(nb == 0, inner_end, outer_end)
-                u_flat_x2 = wp.tile_load(input_eval_arg.dof_values, shape=(nnn_c,), offset=(nb_cell * nnn_c,))
-                U_x2 = wp.tile_astype(wp.tile_reshape(u_flat_x2, shape=(nn_c, n_c)), dtype=accumulate_dtype)  # [ij, k]
-                E_nb_x2 = wp.tile_load(end_ops, shape=(2, n_c), offset=(2 * nb_end, 0))
-                T_x2 = wp.tile_matmul(E_nb_x2, wp.tile_transpose(U_x2))  # (2, nn): [value; d/dn] over [i, j]
-                Fv_x2 = wp.tile_reshape(wp.tile_view(T_x2, offset=(0, 0), shape=(1, nn_c)), shape=(n_c, n_c))
-                Fg_x2 = wp.tile_reshape(wp.tile_view(T_x2, offset=(1, 0), shape=(1, nn_c)), shape=(n_c, n_c))
-                P_x2 = wp.tile_matmul(S_row_x2, Fv_x2)  # (2q, n)
-                Q_x2 = wp.tile_matmul(P_x2, wp.tile_transpose(S_col_x2))  # (2q, 2q)
-                G1_x2 = wp.tile_matmul(I_row_x2, Fg_x2)
-                Gn_x2 = wp.tile_matmul(G1_x2, wp.tile_transpose(I_col_x2))
-                for t in range(qq_c):
-                    r0 = t // q_c
-                    r1 = t - r0 * q_c
-                    TR[face * 8 + nb * 4 + 0, t] = Q_x2[r0, r1]
-                    TR[face * 8 + nb * 4 + 1, t] = Gn_x2[r0, r1]
-                    TR[face * 8 + nb * 4 + 2, t] = Q_x2[q_c + r0, r1]  # d/d ga0 (longitude)
-                    TR[face * 8 + nb * 4 + 3, t] = Q_x2[r0, q_c + r1]  # d/d ga1 (latitude)
-
-        # --- D stage: seeded integrand evaluations per face quadrature point
-        qp_fields = FieldStruct()
-        _copy_qp_fields()
-
-        for it in range(dloop_c):
-            face = it // qq_c
-            r = it - face * qq_c
-            r0 = r // q_c
-            r1 = r - r0 * q_c
-            axis = face // 2
-            ga0 = (axis + 1) % 3
-            ga1 = (axis + 2) % 3
-            dse = dse_v[face]
-            side_index = side_v[face]
-            w_in = w_in_v[face]
-            w_out = w_out_v[face]
-
-            qp_index = quadrature.point_index(domain_arg, qp_arg, dse, side_index, r)
-            qp_coords = quadrature.point_coords(domain_arg, qp_arg, dse, side_index, r)
-            qp_weight = quadrature.point_weight(domain_arg, qp_arg, dse, side_index, r)
-
-            free_sample = make_free_sample(side_index, qp_coords)
-            vol = domain.element_measure(domain_arg, free_sample)
-            scale = accumulate_dtype(qp_weight * vol)
-            xf_in = inner_grad_transform(domain_arg, free_sample)  # J^{-1} of the inner cell
-            xf_out = outer_grad_transform(domain_arg, free_sample)
-
-            # Inject the B-stage traces (value + physical gradient, inner and outer)
-            base = face * 8
-            inj_arg = InjectedEvalArg()
-            inj_arg.inner_value = value_type(TR[base + 0, r])
-            g_in = grad_type()
-            g_in[axis] = value_type(TR[base + 1, r])
-            g_in[ga0] = value_type(TR[base + 2, r])
-            g_in[ga1] = value_type(TR[base + 3, r])
-            inj_arg.inner_gradient = wp.transpose(xf_in) * g_in
-            inj_arg.outer_value = value_type(TR[base + 4, r])
-            g_out = grad_type()
-            g_out[axis] = value_type(TR[base + 5, r])
-            g_out[ga0] = value_type(TR[base + 6, r])
-            g_out[ga1] = value_type(TR[base + 7, r])
-            inj_arg.outer_gradient = wp.transpose(xf_out) * g_out
-            _set_injected_eval_arg()
-
-            # Seeded test-channel extraction; this cell lifts its own role's
-            # channels (both roles on boundary sides).
-            c0 = accumulate_dtype(0.0)
-            cg = acc_grad_vec()
-            if w_in != accumulate_dtype(0.0):
-                sample = SampleType(side_index, qp_coords, qp_index, qp_weight, DofIndex(0, 0), NULL_DOF_INDEX)
-                c0 += w_in * accumulate_dtype(integrand_func(sample, qp_fields, values))
-                if wp.static(test_uses_grad):
-                    fg = grad_type()
-                    for seed in range(3):
-                        sample = SampleType(
-                            side_index, qp_coords, qp_index, qp_weight, DofIndex(seed + 1, 0), NULL_DOF_INDEX
-                        )
-                        fg[seed] = value_type(integrand_func(sample, qp_fields, values))
-                    fg_ref = xf_in * fg
-                    for k in range(3):
-                        cg[k] += w_in * accumulate_dtype(fg_ref[k])
-            if w_out != accumulate_dtype(0.0):
-                sample = SampleType(
-                    side_index, qp_coords, qp_index, qp_weight, DofIndex(OUTER_VALUE_SEED, 0), NULL_DOF_INDEX
-                )
-                c0 += w_out * accumulate_dtype(integrand_func(sample, qp_fields, values))
-                if wp.static(test_uses_grad):
-                    fg = grad_type()
-                    for seed in range(3):
-                        sample = SampleType(
-                            side_index,
-                            qp_coords,
-                            qp_index,
-                            qp_weight,
-                            DofIndex(OUTER_GRAD_BEGIN + seed, 0),
-                            NULL_DOF_INDEX,
-                        )
-                        fg[seed] = value_type(integrand_func(sample, qp_fields, values))
-                    fg_ref = xf_out * fg
-                    for k in range(3):
-                        cg[k] += w_out * accumulate_dtype(fg_ref[k])
-
-            # Write the coefficients in the per-face lift frame: rows of CB
-            # are contracted by the face-frame-first axis operator. For
-            # axis == 1 the face frame is (latitude, longitude): swap.
-            swapped = wp.where(axis == 1, 1, 0)
-            rr = wp.where(swapped == 1, r1, r0)
-            cc = wp.where(swapped == 1, r0, r1)
-            CB[face * q2_c + rr, cc] = scale * c0
-            if wp.static(test_uses_grad):
-                f0_axis = wp.where(axis == 0, 1, 0)  # face-frame first element axis
-                f1_axis = wp.where(axis == 2, 1, 2)  # face-frame second element axis
-                CB[face * q2_c + q_c + rr, cc] = scale * cg[f0_axis]
-                CB[face * q2_c + rr, q_c + cc] = scale * cg[f1_axis]
-                CA[face * q_c + rr, cc] = scale * cg[axis]
-
-        # --- B^T stage: lift the coefficients back to cell nodal residuals
         r_ax0 = wp.tile_zeros(shape=(n_c, nn_c), dtype=accumulate_dtype)  # [i, jk]
         r_ax1 = wp.tile_zeros(shape=(n_c, nn_c), dtype=accumulate_dtype)  # [j, ik]
         r_ax2 = wp.tile_zeros(shape=(n_c, nn_c), dtype=accumulate_dtype)  # [k, ij]
 
-        # axis 0 faces: row op = longitude (flip-selected), col op = latitude
-        for end in range(dyn2):
-            face = end
-            flip = flip_v[face]
-            E_own_l0 = wp.tile_load(end_ops, shape=(2, n_c), offset=(2 * end, 0))
-            S_row_l0 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip * q2_c, 0))
-            S_col_l0 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(0, 0))
-            I_row_l0 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(flip * q2_c, 0))
-            I_col_l0 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(0, 0))
-            CBf_l0 = wp.tile_view(CB, offset=(face * q2_c, 0), shape=(q2_c, q2_c))
-            X_l0 = wp.tile_matmul(wp.tile_transpose(S_row_l0), CBf_l0)  # (n, 2q)
-            Av_l0 = wp.tile_matmul(X_l0, S_col_l0)  # (n, n): [j, k]
-            CAf_l0 = wp.tile_view(CA, offset=(face * q_c, 0), shape=(q_c, q_c))
-            Y_l0 = wp.tile_matmul(wp.tile_transpose(I_row_l0), CAf_l0)  # (n, q)
-            An_l0 = wp.tile_matmul(Y_l0, I_col_l0)  # (n, n)
-            Z_l0 = wp.tile_zeros(shape=(2, nn_c), dtype=accumulate_dtype)
-            wp.tile_assign(Z_l0, wp.tile_reshape(Av_l0, shape=(1, nn_c)), offset=(0, 0))
-            wp.tile_assign(Z_l0, wp.tile_reshape(An_l0, shape=(1, nn_c)), offset=(1, 0))
-            wp.tile_matmul(wp.tile_transpose(E_own_l0), Z_l0, r_ax0)
+        qp_fields = FieldStruct()
+        _copy_qp_fields()
 
-        # axis 1 faces: row op = latitude (straight), col op = longitude
-        for end in range(dyn2):
-            face = 2 + end
-            flip = flip_v[face]
-            E_own_l1 = wp.tile_load(end_ops, shape=(2, n_c), offset=(2 * end, 0))
-            S_row_l1 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(0, 0))
-            S_col_l1 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip * q2_c, 0))
-            I_row_l1 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(0, 0))
-            I_col_l1 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(flip * q2_c, 0))
-            CBf_l1 = wp.tile_view(CB, offset=(face * q2_c, 0), shape=(q2_c, q2_c))
-            X_l1 = wp.tile_matmul(wp.tile_transpose(S_row_l1), CBf_l1)  # (n, 2q)
-            Av_l1 = wp.tile_matmul(X_l1, S_col_l1)  # (n, n): [i, k]
-            CAf_l1 = wp.tile_view(CA, offset=(face * q_c, 0), shape=(q_c, q_c))
-            Y_l1 = wp.tile_matmul(wp.tile_transpose(I_row_l1), CAf_l1)
-            An_l1 = wp.tile_matmul(Y_l1, I_col_l1)
-            Z_l1 = wp.tile_zeros(shape=(2, nn_c), dtype=accumulate_dtype)
-            wp.tile_assign(Z_l1, wp.tile_reshape(Av_l1, shape=(1, nn_c)), offset=(0, 0))
-            wp.tile_assign(Z_l1, wp.tile_reshape(An_l1, shape=(1, nn_c)), offset=(1, 0))
-            wp.tile_matmul(wp.tile_transpose(E_own_l1), Z_l1, r_ax1)
+        # Injected domain arg: side-constant geometry (normal, measure,
+        # measure ratio) is evaluated once per face below and read by the
+        # integrand through the SideConstantGeometryDomain stand-in.
+        qp_domain_geo = InjectedGeoArg()
+        qp_domain_geo.base = domain_arg
+        face_center = coords_type(scalar_type(0.5), scalar_type(0.5), scalar_type(0.0))
 
-        # axis 2 faces: row op = longitude (flip-selected), col op = latitude
-        for end in range(dyn2):
-            face = 4 + end
-            flip = flip_v[face]
-            E_own_l2 = wp.tile_load(end_ops, shape=(2, n_c), offset=(2 * end, 0))
-            S_row_l2 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(flip * q2_c, 0))
-            S_col_l2 = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(0, 0))
-            I_row_l2 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(flip * q2_c, 0))
-            I_col_l2 = wp.tile_load(tang_ops, shape=(q_c, n_c), offset=(0, 0))
-            CBf_l2 = wp.tile_view(CB, offset=(face * q2_c, 0), shape=(q2_c, q2_c))
-            X_l2 = wp.tile_matmul(wp.tile_transpose(S_row_l2), CBf_l2)
-            Av_l2 = wp.tile_matmul(X_l2, S_col_l2)  # (n, n): [i, j]
-            CAf_l2 = wp.tile_view(CA, offset=(face * q_c, 0), shape=(q_c, q_c))
-            Y_l2 = wp.tile_matmul(wp.tile_transpose(I_row_l2), CAf_l2)
-            An_l2 = wp.tile_matmul(Y_l2, I_col_l2)
-            Z_l2 = wp.tile_zeros(shape=(2, nn_c), dtype=accumulate_dtype)
-            wp.tile_assign(Z_l2, wp.tile_reshape(Av_l2, shape=(1, nn_c)), offset=(0, 0))
-            wp.tile_assign(Z_l2, wp.tile_reshape(An_l2, shape=(1, nn_c)), offset=(1, 0))
-            wp.tile_matmul(wp.tile_transpose(E_own_l2), Z_l2, r_ax2)
+        # Dynamic axis loop (runtime bound = dim): tile temporaries below are
+        # emitted/allocated once, not per unrolled iteration.
+        for axis in range(two + 1):
+            # ---- per-face metadata (block-uniform scalars) -----------------
+            dse2 = meta_int2()
+            side2 = meta_int2()
+            nbend2 = meta_int2()
+            flip2 = meta_int2()
+            bnd2 = meta_int2()
+            w_in2 = meta_scalar2()
+            w_out2 = meta_scalar2()
+
+            dse_raw0 = face_map[cell_index, 2 * axis + 0]
+            active0 = dse_raw0 >= 0
+            dse0 = wp.max(dse_raw0, 0)
+            side_index0 = domain.element_index(domain_index_arg, dse0)
+            in_c0 = geometry.side_inner_cell_index(domain_arg, side_index0)
+            out_c0 = geometry.side_outer_cell_index(domain_arg, side_index0)
+            boundary0 = in_c0 == out_c0
+            nb_cell0 = in_c0
+            dse2[0] = dse0
+            side2[0] = side_index0
+            nbend2[0] = wp.where(boundary0, 0, 1)
+            bnd2[0] = wp.where(boundary0, 1, 0)
+            flip2[0] = wp.where(boundary0, 1, 0)  # 3D longitude flip: altitude == 0
+            w_in2[0] = wp.where(active0 and boundary0, accumulate_dtype(1.0), accumulate_dtype(0.0))
+            w_out2[0] = wp.where(active0, accumulate_dtype(1.0), accumulate_dtype(0.0))
+
+            dse_raw1 = face_map[cell_index, 2 * axis + 1]
+            active1 = dse_raw1 >= 0
+            dse1 = wp.max(dse_raw1, 0)
+            side_index1 = domain.element_index(domain_index_arg, dse1)
+            in_c1 = geometry.side_inner_cell_index(domain_arg, side_index1)
+            out_c1 = geometry.side_outer_cell_index(domain_arg, side_index1)
+            boundary1 = in_c1 == out_c1
+            nb_cell1 = out_c1
+            dse2[1] = dse1
+            side2[1] = side_index1
+            nbend2[1] = wp.where(boundary1, 1, 0)
+            bnd2[1] = wp.where(boundary1, 1, 0)
+            flip2[1] = 0
+            w_in2[1] = wp.where(active1, accumulate_dtype(1.0), accumulate_dtype(0.0))
+            w_out2[1] = wp.where(active1 and boundary1, accumulate_dtype(1.0), accumulate_dtype(0.0))
+
+            act2 = meta_int2()
+            act2[0] = wp.where(active0, 1, 0)
+            act2[1] = wp.where(active1, 1, 0)
+
+            # Skip the whole axis when neither face belongs to the integration
+            # domain (block-uniform branch; e.g. on BoundarySides most of a
+            # boundary cell's faces are inactive).
+            if active0 or active1:
+                # Hoisted side-constant geometry (constant per side on the
+                # qualifying grid geometries): normal, side measure, measure
+                # ratio, and the inverse cell Jacobians.
+                fs0 = make_free_sample(side_index0, face_center)
+                nor0 = domain.element_normal(domain_arg, fs0)
+                meas0 = domain.element_measure(domain_arg, fs0)
+                ratio0 = domain.element_measure_ratio(domain_arg, fs0)
+                xf_in0 = inner_grad_transform(domain_arg, fs0)
+                xf_out0 = outer_grad_transform(domain_arg, fs0)
+                fs1 = make_free_sample(side_index1, face_center)
+                nor1 = domain.element_normal(domain_arg, fs1)
+                meas1 = domain.element_measure(domain_arg, fs1)
+                ratio1 = domain.element_measure_ratio(domain_arg, fs1)
+                xf_in1 = inner_grad_transform(domain_arg, fs1)
+                xf_out1 = outer_grad_transform(domain_arg, fs1)
+
+                # ---- B stage: stacked endpoint + tangential contractions -------
+                # U_cat = [own | nb0 | nb1] in axis-major layout
+                U_cat = wp.tile_zeros(shape=(n_c, nn3_c), dtype=accumulate_dtype)
+                wp.tile_assign(U_cat, wp.tile_view(OWN3, offset=(axis * n_c, 0), shape=(n_c, nn_c)), offset=(0, 0))
+                nb0_flat = wp.tile_load(input_eval_arg.dof_values, shape=(nnn_c,), offset=(nb_cell0 * nnn_c,))
+                NB0 = wp.tile_astype(wp.tile_reshape(nb0_flat, shape=(n_c, nn_c)), dtype=accumulate_dtype)  # [i, jk]
+                nb1_flat = wp.tile_load(input_eval_arg.dof_values, shape=(nnn_c,), offset=(nb_cell1 * nnn_c,))
+                NB1 = wp.tile_astype(wp.tile_reshape(nb1_flat, shape=(n_c, nn_c)), dtype=accumulate_dtype)
+                if axis == 0:
+                    wp.tile_assign(U_cat, NB0, offset=(0, nn_c))
+                    wp.tile_assign(U_cat, NB1, offset=(0, 2 * nn_c))
+                elif axis == 1:
+                    for i in range(n_c):
+                        wp.tile_assign(
+                            U_cat,
+                            wp.tile_reshape(wp.tile_view(NB0, offset=(i, 0), shape=(1, nn_c)), shape=(n_c, n_c)),
+                            offset=(0, nn_c + i * n_c),
+                        )
+                        wp.tile_assign(
+                            U_cat,
+                            wp.tile_reshape(wp.tile_view(NB1, offset=(i, 0), shape=(1, nn_c)), shape=(n_c, n_c)),
+                            offset=(0, 2 * nn_c + i * n_c),
+                        )
+                else:
+                    wp.tile_assign(U_cat, wp.tile_transpose(wp.tile_reshape(NB0, shape=(nn_c, n_c))), offset=(0, nn_c))
+                    wp.tile_assign(
+                        U_cat, wp.tile_transpose(wp.tile_reshape(NB1, shape=(nn_c, n_c))), offset=(0, 2 * nn_c)
+                    )
+
+                # Endpoint traces of all three tensors at BOTH ends in one GEMM:
+                # rows [v(e0); d(e0); v(e1); d(e1)], each row 3 face tensors [t1, t2]
+                T = wp.tile_matmul(E_all, U_cat)  # (4, 3nn)
+
+                # Contract the SECOND face axis (t2) of every face tensor with the
+                # full stacked tangential operator (both flips) in one GEMM: the
+                # (12n, n) reshape's row r = (channel * 3 + block) * n + t1.
+                C1 = wp.tile_matmul(wp.tile_reshape(T, shape=(n12_c, n_c)), Wt_all)  # (12n, 4q)
+
+                # ---- per-face row (t1) contraction + D stage -------------------
+                CBA = wp.tile_zeros(shape=(q4_c, q6_c), dtype=accumulate_dtype)  # flip-padded lift coefficients
+
+                for e in range(two):
+                    # Skip faces outside the integration domain entirely
+                    # (block-uniform branch).
+                    if act2[e] == 1:
+                        nbe = nbend2[e]
+                        # Row-flip / column-flip selection: the side longitude runs
+                        # along t1 for axes 0/2 and along t2 for axis 1.
+                        rflip = wp.where(axis == 1, 0, flip2[e])
+                        cflip = wp.where(axis == 1, flip2[e], 0)
+
+                        # The four needed face tensors as full-width row blocks of C1
+                        C1sel = wp.tile_zeros(
+                            shape=(n_c, q16_c), dtype=accumulate_dtype
+                        )  # [v_own | d_own | v_nb | d_nb]
+                        wp.tile_assign(
+                            C1sel, wp.tile_view(C1, offset=(6 * e * n_c, 0), shape=(n_c, q4_c)), offset=(0, 0)
+                        )
+                        wp.tile_assign(
+                            C1sel, wp.tile_view(C1, offset=((6 * e + 3) * n_c, 0), shape=(n_c, q4_c)), offset=(0, q4_c)
+                        )
+                        wp.tile_assign(
+                            C1sel,
+                            wp.tile_view(C1, offset=((6 * nbe + 1 + e) * n_c, 0), shape=(n_c, q4_c)),
+                            offset=(0, 2 * q4_c),
+                        )
+                        wp.tile_assign(
+                            C1sel,
+                            wp.tile_view(C1, offset=((6 * nbe + 4 + e) * n_c, 0), shape=(n_c, q4_c)),
+                            offset=(0, 3 * q4_c),
+                        )
+
+                        # Row (t1) contraction for all four tensors in one GEMM; rows
+                        # of QF are [interp(q); deriv(q)] at this face's row flip.
+                        rowop = wp.tile_load(tang_ops, shape=(q2_c, n_c), offset=(rflip * q2_c, 0))
+                        QF = wp.tile_matmul(rowop, C1sel)  # (2q, 16q)
+
+                        # ---- D stage: seeded integrand evaluations per face QP -----
+                        dse = dse2[e]
+                        side_index = side2[e]
+                        w_in = w_in2[e]
+                        w_out = w_out2[e]
+                        t1_axis = wp.where(axis == 0, 1, 0)  # face-frame first element axis
+                        t2_axis = wp.where(axis == 2, 1, 2)  # face-frame second element axis
+                        qoff = cflip * q2_c
+                        rbase = rflip * q2_c
+                        cb = q3_c * e
+
+                        # Per-face hoisted geometry (side constants on grids)
+                        meas = wp.where(e == 0, meas0, meas1)
+                        xf_in = wp.where(e == 0, xf_in0, xf_in1)  # J^{-1} of the inner cell
+                        xf_out = wp.where(e == 0, xf_out0, xf_out1)
+                        qp_domain_geo.normal = wp.where(e == 0, nor0, nor1)
+                        qp_domain_geo.measure = meas
+                        qp_domain_geo.measure_ratio = wp.where(e == 0, ratio0, ratio1)
+
+                        for r in range(qq_c):
+                            r0 = r // q_c
+                            r1 = r - r0 * q_c
+                            # t1/t2 quadrature indices: s0 (longitude, slow) runs along
+                            # t1 for axes 0/2 and along t2 for axis 1.
+                            ri = wp.where(axis == 1, r1, r0)
+                            ci = wp.where(axis == 1, r0, r1)
+
+                            qp_index = quadrature.point_index(domain_arg, qp_arg, dse, side_index, r)
+                            qp_coords = quadrature.point_coords(domain_arg, qp_arg, dse, side_index, r)
+                            qp_weight = quadrature.point_weight(domain_arg, qp_arg, dse, side_index, r)
+                            scale = accumulate_dtype(qp_weight * meas)
+
+                            # Column-block bases of this face's inner/outer roles in QF
+                            own_role_inner = bnd2[e] == 1 or e == 1
+                            in_vb = wp.where(own_role_inner, 0, 2 * q4_c)
+                            out_vb = wp.where(bnd2[e] == 1 or e == 0, 0, 2 * q4_c)
+
+                            # Inject the B-stage traces (value + physical gradient, inner and outer)
+                            inj_arg = InjectedEvalArg()
+                            inj_arg.inner_value = value_type(QF[ri, in_vb + qoff + ci])
+                            g_in = grad_type()
+                            g_in[axis] = value_type(QF[ri, in_vb + q4_c + qoff + ci])
+                            g_in[t1_axis] = value_type(QF[q_c + ri, in_vb + qoff + ci])
+                            g_in[t2_axis] = value_type(QF[ri, in_vb + qoff + q_c + ci])
+                            inj_arg.inner_gradient = wp.transpose(xf_in) * g_in
+                            inj_arg.outer_value = value_type(QF[ri, out_vb + qoff + ci])
+                            g_out = grad_type()
+                            g_out[axis] = value_type(QF[ri, out_vb + q4_c + qoff + ci])
+                            g_out[t1_axis] = value_type(QF[q_c + ri, out_vb + qoff + ci])
+                            g_out[t2_axis] = value_type(QF[ri, out_vb + qoff + q_c + ci])
+                            inj_arg.outer_gradient = wp.transpose(xf_out) * g_out
+                            _set_injected_eval_arg()
+
+                            # Seeded test-channel extraction; this cell lifts its own
+                            # role's channels (both roles on boundary sides).
+                            c0 = accumulate_dtype(0.0)
+                            cg = acc_grad_vec()
+                            if w_in != accumulate_dtype(0.0):
+                                sample = SampleType(
+                                    side_index, qp_coords, qp_index, qp_weight, DofIndex(0, 0), NULL_DOF_INDEX
+                                )
+                                c0 += w_in * accumulate_dtype(integrand_func(sample, qp_fields, values))
+                                if wp.static(test_uses_grad):
+                                    fg = grad_type()
+                                    for seed in range(3):
+                                        sample = SampleType(
+                                            side_index,
+                                            qp_coords,
+                                            qp_index,
+                                            qp_weight,
+                                            DofIndex(seed + 1, 0),
+                                            NULL_DOF_INDEX,
+                                        )
+                                        fg[seed] = value_type(integrand_func(sample, qp_fields, values))
+                                    fg_ref = xf_in * fg
+                                    for k in range(3):
+                                        cg[k] += w_in * accumulate_dtype(fg_ref[k])
+                            if w_out != accumulate_dtype(0.0):
+                                sample = SampleType(
+                                    side_index,
+                                    qp_coords,
+                                    qp_index,
+                                    qp_weight,
+                                    DofIndex(OUTER_VALUE_SEED, 0),
+                                    NULL_DOF_INDEX,
+                                )
+                                c0 += w_out * accumulate_dtype(integrand_func(sample, qp_fields, values))
+                                if wp.static(test_uses_grad):
+                                    fg = grad_type()
+                                    for seed in range(3):
+                                        sample = SampleType(
+                                            side_index,
+                                            qp_coords,
+                                            qp_index,
+                                            qp_weight,
+                                            DofIndex(OUTER_GRAD_BEGIN + seed, 0),
+                                            NULL_DOF_INDEX,
+                                        )
+                                        fg[seed] = value_type(integrand_func(sample, qp_fields, values))
+                                    fg_ref = xf_out * fg
+                                    for k in range(3):
+                                        cg[k] += w_out * accumulate_dtype(fg_ref[k])
+
+                            # Lift coefficients in the face frame, flip-padded: this
+                            # face's CB block sits at rows rbase..rbase+2q of columns
+                            # cb..cb+2q ([C0 | Ct2; Ct1 | 0]) and its CA block (normal
+                            # derivative, interp rows both sides) at columns cb+2q.
+                            CBA[rbase + ri, cb + ci] = scale * c0
+                            if wp.static(test_uses_grad):
+                                CBA[rbase + ri, cb + q_c + ci] = scale * cg[t2_axis]
+                                CBA[rbase + q_c + ri, cb + ci] = scale * cg[t1_axis]
+                                CBA[rbase + ri, cb + q2_c + ci] = scale * cg[axis]
+
+                # ---- B^T stage: padded lift, both faces in three GEMMs ---------
+                # X2 = tang_ops^T @ CBA: per face block, X = S_row(rflip)^T @ CB
+                # (n, 2q) and Y = I_row(rflip)^T @ CA (n, q).
+                X2 = wp.tile_matmul(Wt_all, CBA)  # (n, 6q)
+
+                # Pad the column-side flip: X rows at this face's cflip offset
+                # contract with S_col(cflip), Y rows with I_col(cflip).
+                XY = wp.tile_zeros(shape=(n4_c, q4_c), dtype=accumulate_dtype)
+                cflip0 = wp.where(axis == 1, flip2[0], 0)
+                cflip1 = wp.where(axis == 1, flip2[1], 0)
+                wp.tile_assign(XY, wp.tile_view(X2, offset=(0, 0), shape=(n_c, q2_c)), offset=(0, cflip0 * q2_c))
+                wp.tile_assign(XY, wp.tile_view(X2, offset=(0, q2_c), shape=(n_c, q_c)), offset=(n_c, cflip0 * q2_c))
+                wp.tile_assign(
+                    XY, wp.tile_view(X2, offset=(0, q3_c), shape=(n_c, q2_c)), offset=(2 * n_c, cflip1 * q2_c)
+                )
+                wp.tile_assign(
+                    XY, wp.tile_view(X2, offset=(0, q3_c + q2_c), shape=(n_c, q_c)), offset=(3 * n_c, cflip1 * q2_c)
+                )
+                AvAn = wp.tile_matmul(XY, W_all)  # (4n, n): [Av(e0); An(e0); Av(e1); An(e1)]
+
+                # Endpoint lift of both faces in one GEMM: end_ops^T rows pair
+                # [v(e0); d(e0); v(e1); d(e1)] with [Av(e0); An(e0); Av(e1); An(e1)].
+                Z = wp.tile_zeros(shape=(4, nn_c), dtype=accumulate_dtype)
+                for c in range(4):
+                    wp.tile_assign(
+                        Z,
+                        wp.tile_reshape(wp.tile_view(AvAn, offset=(c * n_c, 0), shape=(n_c, n_c)), shape=(1, nn_c)),
+                        offset=(c, 0),
+                    )
+                if axis == 0:
+                    wp.tile_matmul(Et_all, Z, r_ax0)
+                elif axis == 1:
+                    wp.tile_matmul(Et_all, Z, r_ax1)
+                else:
+                    wp.tile_matmul(Et_all, Z, r_ax2)
 
         # Combine the three face orientations:
-        # r[i, j*n + k] = r_ax0[i, jk] + r_ax1[j, ik] + r_ax2[k, ij]
+        # r[i, j*n + k] = r_ax0[i, jk] + r_ax1[j, ik] + r_ax2[k, ij].
+        # Written into a FRESH tile: an in-place r_ax0 update would be a
+        # read-modify-write on shared memory racing across the redundant
+        # per-thread element writes (one warp's store can land before
+        # another's load of the same element -- caught by racecheck).
+        r_c = wp.tile_zeros(shape=(n_c, nn_c), dtype=accumulate_dtype)
         for t in range(nnn_c):
             i = t // nn_c
             jk = t - i * nn_c
             j = jk // n_c
             k = jk - j * n_c
-            r_ax0[i, jk] = r_ax0[i, jk] + r_ax1[j, i * n_c + k] + r_ax2[k, i * n_c + j]
+            r_c[i, jk] = r_ax0[i, jk] + r_ax1[j, i * n_c + k] + r_ax2[k, i * n_c + j]
 
-        r_flat = wp.tile_reshape(r_ax0, shape=(1, nnn_c))
+        r_flat = wp.tile_reshape(r_c, shape=(1, nnn_c))
         wp.tile_store(result_elem, r_flat, offset=(block_index, 0))
 
     return integrate_kernel_fn

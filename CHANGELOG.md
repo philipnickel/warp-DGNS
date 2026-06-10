@@ -26,7 +26,9 @@
   (sum-factorized volume terms, default-path DG flux terms) via a new `--sumfac` flag. Linear side (DG face) forms over
   `fem.Sides`/`fem.BoundarySides` (or side subdomains) of `Grid2D`/`Grid3D` geometries are also supported with
   sum-factorized face traces, enabling fully matrix-free DG operators (e.g. SIPG diffusion: sum-factorized volume apply
-  plus sum-factorized interior-penalty flux apply); bilinear side forms keep using the default assembly.
+  plus sum-factorized interior-penalty flux apply); bilinear side forms keep using the default assembly. The
+  sum-factorized side apply is around 5x faster than its first release (stacked face-trace operators, per-face
+  geometry hoisting, launch-plan caching).
 
 ### Removed
 

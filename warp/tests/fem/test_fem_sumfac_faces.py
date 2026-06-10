@@ -122,6 +122,68 @@ def asym_trace_form(s: fem.Sample, domain: fem.Domain, u: fem.Field, v: fem.Fiel
 
 
 @fem.integrand
+def tangential_grad_form_2d(s: fem.Sample, u: fem.Field, v: fem.Field, tvec: wp.vec2d):
+    # Tangential-gradient oracle: every other committed form dots gradients
+    # with the (axis-aligned) grid side normal, so without this form the
+    # tangential trace/lift code paths carry exactly zero.
+    return (
+        wp.dot(fem.grad_average(u, s), tvec) * fem.jump(v, s)
+        + fem.jump(u, s) * wp.dot(fem.grad_jump(v, s), tvec)
+        + wp.float64(0.5) * wp.dot(fem.grad_jump(u, s), tvec) * wp.dot(fem.grad_average(v, s), tvec)
+    )
+
+
+@fem.integrand
+def tangential_grad_form_3d(s: fem.Sample, u: fem.Field, v: fem.Field, tvec: wp.vec3d):
+    return (
+        wp.dot(fem.grad_average(u, s), tvec) * fem.jump(v, s)
+        + fem.jump(u, s) * wp.dot(fem.grad_jump(v, s), tvec)
+        + wp.float64(0.5) * wp.dot(fem.grad_jump(u, s), tvec) * wp.dot(fem.grad_average(v, s), tvec)
+    )
+
+
+@fem.integrand
+def sip_position_coef_form_2d(
+    s: fem.Sample, domain: fem.Domain, u: fem.Field, v: fem.Field, penalty_scale: wp.float64, tvec: wp.vec2d
+):
+    # Position-dependent coefficient oracle: the symmetric Gauss rule plus
+    # position-independent integrands make any CONSISTENT longitude-flip
+    # transcription error an exact quadrature-point relabeling, invisible to
+    # the constant-coefficient forms; the asymmetric coefficient breaks that
+    # symmetry on the value, normal-gradient, and tangential-gradient channels.
+    pos = fem.position(domain, s)
+    nor = fem.normal(domain, s)
+    coef = wp.float64(1.0) + wp.float64(0.5) * wp.sin(wp.float64(2.3) * pos[0] + wp.float64(1.1) * pos[1])
+    penalty = penalty_scale * fem.measure_ratio(domain, s)
+    return coef * (
+        penalty * fem.jump(u, s) * fem.jump(v, s)
+        - wp.dot(fem.grad_average(u, s), nor) * fem.jump(v, s)
+        - wp.dot(fem.grad_average(v, s), nor) * fem.jump(u, s)
+        + wp.dot(fem.grad_jump(u, s), tvec) * fem.jump(v, s)
+        + fem.average(u, s) * wp.dot(fem.grad_average(v, s), tvec)
+    )
+
+
+@fem.integrand
+def sip_position_coef_form_3d(
+    s: fem.Sample, domain: fem.Domain, u: fem.Field, v: fem.Field, penalty_scale: wp.float64, tvec: wp.vec3d
+):
+    pos = fem.position(domain, s)
+    nor = fem.normal(domain, s)
+    coef = wp.float64(1.0) + wp.float64(0.5) * wp.sin(
+        wp.float64(2.3) * pos[0] + wp.float64(1.1) * pos[1] + wp.float64(1.7) * pos[2]
+    )
+    penalty = penalty_scale * fem.measure_ratio(domain, s)
+    return coef * (
+        penalty * fem.jump(u, s) * fem.jump(v, s)
+        - wp.dot(fem.grad_average(u, s), nor) * fem.jump(v, s)
+        - wp.dot(fem.grad_average(v, s), nor) * fem.jump(u, s)
+        + wp.dot(fem.grad_jump(u, s), tvec) * fem.jump(v, s)
+        + fem.average(u, s) * wp.dot(fem.grad_average(v, s), tvec)
+    )
+
+
+@fem.integrand
 def side_at_node_form(s: fem.Sample, u: fem.Field, v: fem.Field):
     # Linear in v, but reads the test field through a node-based operator
     return u(fem.at_node(v, s)) * fem.inner(v, s)
@@ -352,9 +414,13 @@ def test_side_apply_equals_naive_2d(test, device):
         interior = _interior_sides(geo)
         sip_values = {"penalty_scale": wp.float64(8.0)}
         upwind_values = {"vel": wp.vec2d(0.7, -0.3)}
+        tang_values = {"tvec": wp.vec2d(0.6, -1.3)}
+        pos_values = {"penalty_scale": wp.float64(4.0), "tvec": wp.vec2d(0.7, 0.4)}
         for domain in (sides, boundary, interior):
             _check_side_apply_matches_naive(test, geo, domain, sip_side_form, sip_values, rng)
             _check_side_apply_matches_naive(test, geo, domain, upwind_form_2d, upwind_values, rng)
+            _check_side_apply_matches_naive(test, geo, domain, tangential_grad_form_2d, tang_values, rng)
+            _check_side_apply_matches_naive(test, geo, domain, sip_position_coef_form_2d, pos_values, rng)
         # Asymmetric form: exercises every channel pairing; non-degenerate on boundaries
         _check_side_apply_matches_naive(test, geo, sides, asym_trace_form, {}, rng)
         _check_side_apply_matches_naive(test, geo, boundary, asym_trace_form, {}, rng)
@@ -369,9 +435,13 @@ def test_side_apply_equals_naive_3d(test, device):
         interior = _interior_sides(geo)
         sip_values = {"penalty_scale": wp.float64(8.0)}
         upwind_values = {"vel": wp.vec3d(0.7, -0.3, 0.4)}
+        tang_values = {"tvec": wp.vec3d(0.6, -1.3, 0.8)}
+        pos_values = {"penalty_scale": wp.float64(4.0), "tvec": wp.vec3d(0.7, 0.4, -0.9)}
         for domain in (sides, boundary, interior):
             _check_side_apply_matches_naive(test, geo, domain, sip_side_form, sip_values, rng)
             _check_side_apply_matches_naive(test, geo, domain, upwind_form_3d, upwind_values, rng)
+            _check_side_apply_matches_naive(test, geo, domain, tangential_grad_form_3d, tang_values, rng)
+            _check_side_apply_matches_naive(test, geo, domain, sip_position_coef_form_3d, pos_values, rng)
         _check_side_apply_matches_naive(test, geo, sides, asym_trace_form, {}, rng)
         _check_side_apply_matches_naive(test, geo, boundary, asym_trace_form, {}, rng)
 

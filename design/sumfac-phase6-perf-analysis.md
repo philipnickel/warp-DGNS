@@ -90,3 +90,19 @@ project. What it establishes, and how it re-ranks our plan:
 - **A100 expectation setting**: A100 FP64-TC peak is 19.5 TFLOP/s (~3.4x below H100's 67);
   related work (CEED-MS40) saw DMMA gains on A100 "mainly for orders above 10" -- at P=4
   the win must come from filling tiles (E_b/stacking), not from DMMA per se.
+
+## Perf round result (2026-06-10, committed with this note)
+
+5.072 -> 1.005 ms/apply (5.0x), oracle 6.8e-16 unchanged. Steps: stacked per-axis face
+operators 24->8 GEMMs/cell (4.89 ms); injected side-constant geometry + per-face hoists +
+block-uniform inactive-face skips (1.75 ms); block_dim 32 (1.02 ms); side-plan cache, host
+floor 0.462->0.120 ms (1.005 ms). NCU flipped exactly per the core reference: LSU wavefronts
+69% -> 7.7%, FP64 pipe -> 67.6%, DRAM 0.15% (~360x less traffic than the bsr_mv matrix
+stream). Fully-MF SIPG matvec: 0.072 -> 0.258 GDOF/s (hybrid reference 0.398). Bonus: a
+LATENT pre-existing shared-memory race in the cell-residual combine (redundant-per-thread
+RMW on a shared tile) was exposed at >=96^2 cells and fixed (racecheck 5 hazard classes ->
+0; CPU/CUDA now bit-identical). Remaining wall: the 0.365 ms target is NOT met on the RTX
+5090 because the seeded D stage executes 32x-redundant scalar FP64 work (~1.0e9 lane-ops ~=
+1 ms at this chip's 1/64-rate FP64). Memory is a non-factor. Exits: E_b multi-cell panels
+(the queued campaign) or lane-distributed seeded evaluation (needs a Warp primitive that
+does not exist). On A100 (1:2-rate FP64) the same kernel plausibly meets the target as-is.
