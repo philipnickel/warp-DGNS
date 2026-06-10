@@ -38,9 +38,11 @@
   bilinear kernel at n=5, and the standalone contraction kernels using the same 5×5×5 GEMM are all fine. So
   `test_apply_*_2d`/`test_affine_form_matches_default`/`test_assembly_apply_consistency` fail on CUDA while
   everything else (incl. end-to-end DG P=4) passes. A nested-loop gather rewrite avoids it at runtime but was
-  rejected as a fix (perturbs the design to dodge a linker bug). Next steps: report to NVIDIA (artifact pair:
-  cached truncated `*.sm120.ptx` vs the correct NVRTC-only compile of the same cached `.cu`) and to
-  NVIDIA/warp; try a newer libmathdx (different LTOIR producer); re-test when a fixed nvJitLink ships.
+  rejected as a fix (perturbs the design to dodge a linker bug). Both officially-pinned toolchain pairings
+  (CUDA 12.9 + libmathdx 0.3.1 and CUDA 13.0 + libmathdx 0.3.2) reproduce it, and libmathdx 0.3.2 is the
+  newest cu13 build on NVIDIA's redist (0.3.3+/0.4.0 probed: 404), so there is no newer LTOIR producer to
+  try. Next steps: report to NVIDIA (artifact pair: cached truncated `*.sm120.ptx` vs the correct NVRTC-only
+  compile of the same cached `.cu`) and to NVIDIA/warp; re-test when a newer nvJitLink/libmathdx ships.
 
 - Bilinear sumfac tests use axis-aligned grids only; a non-affine (Quadmesh2D) bilinear oracle test would catch off-diagonal-Jacobian errors in the both-sides J⁻¹ channel mapping (the *apply* path does have a non-affine check).
 - `E_b > 1` is implemented only in the standalone contraction primitives, not the fused kernels (bench says E_b=1 is optimal at P≥4 anyway; E_b≈4 would help near the crossover).
