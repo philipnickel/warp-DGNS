@@ -89,6 +89,22 @@ automatically where the hardware has them. The 3D kernel keeps its existing
 `tile_load`; the rotation-based dimension-generic emitter validated in the
 spike is the follow-up that unifies 2D/3D/faces (R6).
 
+### Output: direct block-diagonal store (bilinear assembly)
+
+The elements-as-tile-space representation applies to the *output* side of
+bilinear assembly too. For a DG space on the whole partition the assembled
+matrix is element-block-diagonal, so its compact BSR topology is a closed
+form: row `r` holds exactly `N = n^d` entries starting at `offsets[r] = r·N`,
+and the entry coupling local nodes `(i, j)` of element `e` sits at value index
+`e·N² + i·N + j`. `set_block_diagonal_topology()` writes both CSR arrays with
+two trivial kernels (no triplets, no radix sort, no duplicate merge — the
+steps that dominate `bsr_set_from_triplets`), and the fused kernel
+`tile_store`s column `j` of element `e`'s local block as an `(N, 1)` tile at
+offset `(e·N, j)` of the values array viewed as `(rows, N)` — the matrix
+values are the staging buffer. Both test and trial fields must live on the
+`WholeSpacePartition` (enforced in `find_sumfac_bilinear_layout`); partial
+integration domains keep the full pattern and leave uncovered blocks zero.
+
 ### What the system owns
 
 Batching, memory tiers, load strategy, and tensor-core mapping are the tile

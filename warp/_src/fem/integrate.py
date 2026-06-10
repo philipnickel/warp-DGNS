@@ -1332,6 +1332,7 @@ def _generate_integrate_kernel(
                     test_uses_grad=sumfac_plan.test_uses_grad,
                     trial_uses_grad=sumfac_plan.trial_uses_grad,
                     accumulate_dtype=accumulate_dtype,
+                    output_dtype=output_dtype,
                 )
                 # Both seed selectors travel through the Sample, so the kernel's
                 # `fields` argument is passed to the integrand unchanged.
@@ -1910,8 +1911,9 @@ def _launch_integrate_kernel(
     if nodal:
         nnz = test.space_restriction.node_count()
     elif sumfac_plan is not None:
-        # One triplet per entry of each element's dense local block
-        nnz = domain.element_count() * sumfac_plan.nodes_per_element**2
+        # Closed-form block-diagonal pattern laid over every partition row;
+        # blocks of elements outside the integration domain hold zeros
+        nnz = test.space_partition.node_count() * sumfac_plan.nodes_per_element
     else:
         nnz = test.space_restriction.total_node_element_count() * trial.space.topology.MAX_NODES_PER_ELEMENT
 
@@ -1935,6 +1937,17 @@ def _launch_integrate_kernel(
 
     output_values_require_grad = isinstance(output, BsrMatrix) and output.values.requires_grad
     row_compress_bsr = construction_policy in (_BSR_CONSTRUCTION_ROW_COMPRESS, _BSR_CONSTRUCTION_AUTO)
+
+    if sumfac_plan is not None:
+        if padded_bsr:
+            raise NotImplementedError(
+                "assembly='sumfac' does not support bsr_options['topology']='padded'; the fused kernel "
+                "writes the compact block-diagonal topology directly"
+            )
+        # The closed-form block-diagonal topology is already compact, sorted,
+        # and duplicate-free; the row-compression pre-pass would only
+        # recompute what is known.
+        row_compress_bsr = False
 
     # If we're doing row-local compression or padded assembly,
     # we need to pre-compute per-row capacity.
@@ -1988,7 +2001,11 @@ def _launch_integrate_kernel(
             device=device,
         )
 
-    if row_compress_bsr:
+    if sumfac_plan is not None:
+        # The fused kernel stores element-local blocks directly into the
+        # matrix values; no triplet staging is needed.
+        triplet_rows = triplet_cols = triplet_values = None
+    elif row_compress_bsr:
         triplet_rows = None
         triplet_cols = bsr_result.columns[:nnz]
         triplet_values = _bsr_values_as_3d_array(bsr_result.values[:nnz], bsr_result.block_shape)
@@ -2014,14 +2031,26 @@ def _launch_integrate_kernel(
 
         interp_arr, deriv_arr = sumfac_plan.operator_arrays(accumulate_dtype, device)
 
-        # Column j of element e's local block lands at staging row
-        # e * nodes_per_element + j (one tile_store per column).
-        staging = cache.borrow_temporary(
-            temporary_store,
-            shape=(element_count * nodes_per_element, nodes_per_element),
-            dtype=accumulate_dtype,
+        if capacity_policy == _BSR_CAPACITY_REUSE:
+            _require_bsr_capacity(bsr_result, nnz, "fem.integrate()")
+        sumfac_kernels.set_block_diagonal_topology(bsr_result, nodes_per_element)
+
+        # Scalar 2D view of the matrix values: with the block-diagonal
+        # topology, matrix row r owns exactly the `nodes_per_element`
+        # consecutive value entries starting at r * nodes_per_element, so the
+        # fused kernel tile_stores column j of element e's local block at
+        # view offset (e * nodes_per_element, j).
+        values_view = wp.array(
+            ptr=bsr_result.values.ptr,
+            capacity=bsr_result.values.capacity,
             device=device,
+            dtype=output_dtype,
+            shape=(bsr_result.nrow, nodes_per_element),
         )
+        if element_count * nodes_per_element != bsr_result.nrow:
+            # Partial domain: blocks of uncovered elements must hold zeros
+            # (storage may be freshly allocated or reused, hence undefined)
+            values_view.zero_()
 
         wp.launch_tiled(
             kernel,
@@ -2034,39 +2063,11 @@ def _launch_integrate_kernel(
                 value_struct_values,
                 interp_arr,
                 deriv_arr,
-                staging,
+                values_view,
             ],
             block_dim=sumfac_kernels.sumfac_block_dim(device),
             device=device,
         )
-
-        fill_kernel = sumfac_kernels.get_sumfac_triplet_fill_kernel(
-            domain,
-            test,
-            trial,
-            staging_dtype=accumulate_dtype,
-            output_dtype=output_dtype,
-        )
-        wp.launch(
-            fill_kernel,
-            dim=(element_count, nodes_per_element, nodes_per_element),
-            inputs=[
-                domain_elt_arg,
-                domain_elt_index_arg,
-                test.space.topology.topo_arg_value(device),
-                test.space_partition.partition_arg_value(device),
-                trial.space.topology.topo_arg_value(device),
-                trial.space_partition.partition_arg_value(device),
-                nodes_per_element,
-                staging,
-                triplet_rows,
-                triplet_cols,
-                triplet_values,
-            ],
-            device=device,
-        )
-
-        staging.release()
     elif nodal:
         wp.launch(
             kernel=kernel,
@@ -2187,7 +2188,10 @@ def _launch_integrate_kernel(
             device=device,
         )
 
-    if row_compress_bsr:
+    if sumfac_plan is not None:
+        # Topology and values were written in place by the fused kernel
+        pass
+    elif row_compress_bsr:
         bsr_compress(bsr_result, inplace=not output_values_require_grad, **sparse_bsr_options)
     else:
         if capacity_policy == _BSR_CAPACITY_REUSE and topology == "compact":

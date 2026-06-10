@@ -88,10 +88,10 @@ __all__ = [
     "get_integrate_bilinear_sumfac_kernel",
     "get_integrate_linear_sumfac_kernel",
     "get_sumfac_scatter_kernel",
-    "get_sumfac_triplet_fill_kernel",
     "make_sumfac_bilinear_plan",
     "make_sumfac_linear_operator",
     "make_sumfac_plan",
+    "set_block_diagonal_topology",
     "sumfac_block_dim",
 ]
 
@@ -560,8 +560,10 @@ def find_sumfac_bilinear_layout(
     core (cell domain, tensor-product discontinuous scalar test space,
     lexicographic tensor-product quadrature), the trial field must be defined
     over the *same* function space as the test field (mixed test/trial spaces
-    are rejected) and accessed only through value/gradient operators, and the
-    fused kernel's estimated tile working set must fit the shared-memory
+    are rejected) and accessed only through value/gradient operators, both
+    fields must live on the whole space partition (the fused kernel stores
+    element-local blocks directly at element-major matrix rows/columns), and
+    the fused kernel's estimated tile working set must fit the shared-memory
     budget. Raises :class:`SumfacNotApplicableError` naming the first unmet
     requirement.
 
@@ -584,6 +586,18 @@ def find_sumfac_bilinear_layout(
             "assembly='sumfac' requires the trial field to be defined over the same function space as the "
             f"test field; got '{trial.space.name}' vs '{space.name}'"
         )
+
+    # The fused kernel stores element-local blocks directly at the
+    # element-major rows/columns ``element_index * nodes_per_element + i`` of
+    # the block-diagonal matrix; this equals the partition node index only on
+    # the whole space partition.
+    for role, field in (("test", test), ("trial", trial)):
+        if not isinstance(field.space_partition, WholeSpacePartition):
+            raise SumfacNotApplicableError(
+                f"assembly='sumfac' bilinear assembly requires the {role} field to be defined over the whole "
+                f"space partition (got {type(field.space_partition).__name__}); the fused kernel stores "
+                "element-local blocks directly at element-major matrix rows"
+            )
 
     trial_operators = _check_seedable_operators(
         integrand, arguments.trial_name, _SUPPORTED_TEST_OPERATORS, "trial field"
@@ -1063,6 +1077,7 @@ def get_integrate_bilinear_sumfac_kernel(
     test_uses_grad: bool,
     trial_uses_grad: bool,
     accumulate_dtype,
+    output_dtype,
 ):
     """Build the fused sum-factorized assembly kernel body for a qualifying bilinear form.
 
@@ -1081,7 +1096,11 @@ def get_integrate_bilinear_sumfac_kernel(
     seeded integrand evaluations per point, gradient channels mapped to
     reference space with ``J^{-1}`` on both sides), then forms the local
     block column by column as the ``B^T D B`` action on the one-hot trial
-    vectors, storing each column to the per-element staging array. All loops
+    vectors, storing each column directly into the matrix values (viewed as
+    one row of ``nodes_per_element`` entries per block row, with the
+    element-block-diagonal topology built in closed form by
+    :func:`set_block_diagonal_topology` -- no triplets, no sorting). Rows are
+    indexed by the geometry cell index, matching the topology. All loops
     have compile-time bounds and there are no early returns (uniform control
     flow over the tile operations).
 
@@ -1104,6 +1123,8 @@ def get_integrate_bilinear_sumfac_kernel(
         trial_uses_grad: Same for the trial field.
         accumulate_dtype: Scalar type used for the tile contractions and
             coefficient accumulation.
+        output_dtype: Scalar type of the matrix values array the local
+            blocks are stored into.
     """
     if element_batch != 1:
         raise NotImplementedError("Sum-factorized integration currently requires element_batch == 1")
@@ -1132,7 +1153,7 @@ def get_integrate_bilinear_sumfac_kernel(
             values: ValueStruct,
             interp: wp.array2d(dtype=accumulate_dtype),
             deriv: wp.array2d(dtype=accumulate_dtype),
-            staging: wp.array2d(dtype=accumulate_dtype),
+            values_out: wp.array2d(dtype=output_dtype),
         ):
             domain_element_index = wp.tid()
             element_index = domain.element_index(domain_index_arg, domain_element_index)
@@ -1241,8 +1262,8 @@ def get_integrate_bilinear_sumfac_kernel(
                     tmp2 = wp.tile_matmul(a_t, f1_eta)
                     wp.tile_matmul(tmp2, d_tile, r)
 
-                r_flat = wp.tile_reshape(r, shape=(1, nn_c))
-                wp.tile_store(staging, r_flat, offset=(domain_element_index * nn_c + col, 0))
+                r_col = wp.tile_astype(wp.tile_reshape(r, shape=(nn_c, 1)), dtype=output_dtype)
+                wp.tile_store(values_out, r_col, offset=(element_index * nn_c, col))
 
         return integrate_kernel_fn
 
@@ -1257,7 +1278,7 @@ def get_integrate_bilinear_sumfac_kernel(
         values: ValueStruct,
         interp: wp.array2d(dtype=accumulate_dtype),
         deriv: wp.array2d(dtype=accumulate_dtype),
-        staging: wp.array2d(dtype=accumulate_dtype),
+        values_out: wp.array2d(dtype=output_dtype),
     ):
         domain_element_index = wp.tid()
         element_index = domain.element_index(domain_index_arg, domain_element_index)
@@ -1424,88 +1445,67 @@ def get_integrate_bilinear_sumfac_kernel(
 
                 wp.tile_assign(r, wp.tile_reshape(r_blk, shape=(1, nn_c)), offset=(i, 0))
 
-            r_flat = wp.tile_reshape(r, shape=(1, nnn_c))
-            wp.tile_store(staging, r_flat, offset=(domain_element_index * nnn_c + col, 0))
+            r_col = wp.tile_astype(wp.tile_reshape(r, shape=(nnn_c, 1)), dtype=output_dtype)
+            wp.tile_store(values_out, r_col, offset=(element_index * nnn_c, col))
 
     return integrate_kernel_fn
 
 
-def get_sumfac_triplet_fill_kernel(
-    domain: GeometryDomain,
-    test: TestField,
-    trial: TrialField,
-    staging_dtype,
-    output_dtype,
-):
-    """Build (and cache) the kernel scattering per-element local blocks to BSR triplets.
+@wp.kernel(enable_backward=False)
+def _fill_block_diagonal_offsets(nodes_per_element: int, offsets: wp.array(dtype=int)):
+    row = wp.tid()
+    offsets[row] = row * nodes_per_element
 
-    The fused assembly kernel stores column ``j`` of element ``e``'s local
-    block at staging row ``e * nodes_per_element + j``; this kernel writes
-    the matching ``(row, column, value)`` triplet for every entry, with the
-    triplet index equal to the flattened staging index so that
-    ``bsr_set_from_triplets`` receives one triplet per local-block entry.
-    Nodes outside the test (row) or trial (column) partitions are marked with
-    ``NULL_NODE_INDEX`` and ignored by the BSR construction, mirroring the
-    legacy bilinear kernels.
+
+@wp.kernel(enable_backward=False)
+def _fill_block_diagonal_columns(nodes_per_element: int, columns: wp.array(dtype=int)):
+    k = wp.tid()
+    element = k // (nodes_per_element * nodes_per_element)
+    columns[k] = element * nodes_per_element + k % nodes_per_element
+
+
+def set_block_diagonal_topology(matrix, nodes_per_element: int) -> int:
+    """Set ``matrix`` to the block-diagonal topology of an element-major DG space, in closed form.
+
+    For a discontinuous tensor-product space stored element-major (the layout
+    enforced by :func:`find_sumfac_bilinear_layout`), the assembled matrix is
+    block diagonal with one dense ``nodes_per_element`` x ``nodes_per_element``
+    block per element: row ``r`` holds exactly ``nodes_per_element`` entries,
+    and the entry coupling local nodes ``(i, j)`` of element ``e`` sits at the
+    fixed position ``e * nodes_per_element**2 + i * nodes_per_element + j`` of
+    the values array. Both CSR arrays therefore follow closed forms -- no
+    triplets, no sorting, no duplicate merging -- and the fused assembly kernel
+    can ``tile_store`` element-local blocks directly into ``matrix.values``.
+
+    The pattern is laid over *all* ``matrix.nrow`` rows (the row count must be
+    a multiple of ``nodes_per_element``); blocks of elements outside the
+    integration domain are simply left to hold zero values.
 
     Args:
-        domain: Cell domain of the integration.
-        test: Test field (provides the row topology and partition).
-        trial: Trial field (provides the column topology and partition).
-        staging_dtype: Scalar type of the per-element staging array.
-        output_dtype: Scalar type of the triplet values array.
+        matrix: Square :class:`warp.sparse.BsrMatrix` with scalar blocks whose
+            topology is overwritten in place.
+        nodes_per_element: Number of nodes per element of the (shared)
+            test/trial space.
+
+    Returns:
+        The number of non-zero blocks of the new topology.
     """
-    test_topology = test.space.topology
-    trial_topology = trial.space.topology
-    test_partition = test.space_partition
-    trial_partition = trial.space_partition
-
-    @cache.dynamic_kernel(
-        suffix=(
-            "sumfac_triplet_fill",
-            domain.name,
-            test.space.name,
-            test_partition.name,
-            trial.space.name,
-            trial_partition.name,
-            cache.pod_type_key(staging_dtype),
-            cache.pod_type_key(output_dtype),
-        ),
-        kernel_options={"enable_backward": False},
+    nnz = matrix.nrow * nodes_per_element
+    wp.launch(
+        _fill_block_diagonal_offsets,
+        dim=matrix.nrow + 1,
+        inputs=[nodes_per_element, matrix.offsets],
+        device=matrix.device,
     )
-    def sumfac_triplet_fill_kernel(
-        domain_arg: domain.ElementArg,
-        domain_index_arg: domain.ElementIndexArg,
-        test_topo_arg: test_topology.TopologyArg,
-        test_partition_arg: test_partition.PartitionArg,
-        trial_topo_arg: trial_topology.TopologyArg,
-        trial_partition_arg: trial_partition.PartitionArg,
-        nodes_per_element: int,
-        staging: wp.array2d(dtype=staging_dtype),
-        triplet_rows: wp.array(dtype=int),
-        triplet_cols: wp.array(dtype=int),
-        triplet_values: wp.array3d(dtype=output_dtype),
-    ):
-        domain_element_index, trial_node, test_node = wp.tid()
-        element_index = domain.element_index(domain_index_arg, domain_element_index)
-
-        staging_row = domain_element_index * nodes_per_element + trial_node
-        triplet_index = staging_row * nodes_per_element + test_node
-
-        test_node_index = test_topology.element_node_index(domain_arg, test_topo_arg, element_index, test_node)
-        row = test_partition.partition_node_index(test_partition_arg, test_node_index)
-        trial_node_index = trial_topology.element_node_index(domain_arg, trial_topo_arg, element_index, trial_node)
-        col = trial_partition.partition_node_index(trial_partition_arg, trial_node_index)
-        if row == NULL_NODE_INDEX or col == NULL_NODE_INDEX:
-            # Will get ignored when converting to BSR
-            row = NULL_NODE_INDEX
-            col = NULL_NODE_INDEX
-
-        triplet_rows[triplet_index] = row
-        triplet_cols[triplet_index] = col
-        triplet_values[triplet_index, 0, 0] = output_dtype(staging[staging_row, test_node])
-
-    return sumfac_triplet_fill_kernel
+    matrix.row_counts = None  # compact topology: rows fully occupy [offsets[r], offsets[r + 1])
+    matrix.notify_nnz_changed(nnz=nnz)
+    wp.launch(
+        _fill_block_diagonal_columns,
+        dim=nnz,
+        inputs=[nodes_per_element, matrix.columns],
+        device=matrix.device,
+    )
+    return nnz
 
 
 def get_sumfac_scatter_kernel(

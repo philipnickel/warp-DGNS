@@ -8,8 +8,9 @@ bilinear form (cell domain, same scalar discontinuous tensor-product space on
 both sides, tensor-product ``RegularQuadrature``, value and gradient operators
 only), the sum-factorized path assembles the element-block-diagonal sparse
 matrix through the fused ``B^T D B`` action instead of the naive per-entry
-quadrature loop, and feeds the same ``bsr_set_from_triplets`` tail as the
-legacy kernels. The default ``integrate()`` path is the golden oracle
+quadrature loop, building the block-diagonal BSR topology in closed form and
+storing element-local blocks directly into the matrix values (no triplets, no
+sorting). The default ``integrate()`` path is the golden oracle
 throughout: the assembled matrices must agree entry-wise in dense form.
 Forms that do not qualify raise a descriptive error instead of silently
 falling back.
@@ -250,6 +251,40 @@ def test_assembly_apply_consistency(test, device):
             np.testing.assert_allclose(y_mat.numpy(), y_apply.numpy(), rtol=1e-9, atol=1e-10)
 
 
+def test_assembly_output_reuse_and_add(test, device):
+    """Direct-store assembly composes with ``output=`` reuse and ``add=True`` like the naive path."""
+
+    with wp.ScopedDevice(device):
+        geo = _make_grid_2d()
+        _space, _domain, test_field, trial_field, quadrature = _make_dg_case(geo, 4)
+
+        matrix_naive, _ = _integrate_matrix(mass_form, test_field, trial_field, quadrature, None)
+
+        def integrate_sumfac(form, **kwargs):
+            with _capture_integrate_kernel() as captured:
+                result = fem.integrate(
+                    form,
+                    fields={"u": trial_field, "v": test_field},
+                    quadrature=quadrature,
+                    output_dtype=wp.float64,
+                    assembly="sumfac",
+                    **kwargs,
+                )
+            test.assertTrue(_is_sumfac_kernel(captured["kernel"]))
+            return result
+
+        # capacity='reuse': assemble stiffness first, then overwrite with mass
+        # in place -- exercises the closed-form topology rewrite and the
+        # capacity check on reused storage
+        matrix = integrate_sumfac(stiffness_form)
+        integrate_sumfac(mass_form, output=matrix, bsr_options={"capacity": "reuse"})
+        np.testing.assert_allclose(_bsr_to_dense(matrix), _bsr_to_dense(matrix_naive), rtol=1e-9, atol=1e-10)
+
+        # add=True: the direct-store matrix feeds bsr_axpy like any other
+        integrate_sumfac(mass_form, output=matrix, add=True)
+        np.testing.assert_allclose(_bsr_to_dense(matrix), 2.0 * _bsr_to_dense(matrix_naive), rtol=1e-9, atol=1e-10)
+
+
 def test_assembly_arg_selects_sumfac_bilinear(test, device):
     """assembly="sumfac" always selects the sum-factorized assembly kernel; the default never does."""
 
@@ -354,6 +389,17 @@ class TestFemSumfacAssembly(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "scalar"):
             integrate_sumfac(vec_mass_form, {"u": vec_trial, "v": vec_test}, vec_quadrature)
 
+        # Partial space partition: the direct block-diagonal store requires
+        # element-major whole-space matrix rows/columns
+        part_geo = fem.LinearGeometryPartition(geo, 0, 2)
+        part_space_partition = fem.make_space_partition(space.topology, part_geo)
+        part_domain = fem.Cells(geometry=part_geo)
+        part_test = fem.make_test(space=space, space_partition=part_space_partition, domain=part_domain)
+        part_trial = fem.make_trial(space=space, space_partition=part_space_partition, domain=part_domain)
+        part_quadrature = fem.RegularQuadrature(part_domain, order=4)
+        with self.assertRaisesRegex(NotImplementedError, "whole space partition"):
+            integrate_sumfac(mass_form, {"u": part_trial, "v": part_test}, part_quadrature)
+
         # Shared-memory budget: 3D P=5 float64 bilinear exceeds the tile working-set
         # estimate deterministically (host-side arithmetic, no kernel compiles)
         geo3 = _make_grid_3d()
@@ -407,6 +453,12 @@ add_function_test(
     TestFemSumfacAssembly,
     "test_assembly_arg_selects_sumfac_bilinear",
     test_assembly_arg_selects_sumfac_bilinear,
+    devices=devices,
+)
+add_function_test(
+    TestFemSumfacAssembly,
+    "test_assembly_output_reuse_and_add",
+    test_assembly_output_reuse_and_add,
     devices=devices,
 )
 
