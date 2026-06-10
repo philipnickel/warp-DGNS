@@ -84,6 +84,11 @@
   (DRAM 40%, SM 12% -- bandwidth-bound), full matvec 1.04 ms. Quantifies the Phase 6 payoff: ~40% of the hybrid
   operator is the memory-bound non-sumfac side path. Note sm_120 has no FP64 tensor cores; DMMA utilization is
   an A100 metric. No nsys in the pixi env (`pixi add nsight-systems` if a timeline is needed).
+- Fully matrix-free SIPG side apply works TODAY through the native path (linear side form over
+  `u_field.trace()` with jump/grad_average; matches `K_side @ x` to 7e-16) at 6.59 ms/apply -- 15x the
+  assembled-matrix matvec, since each side QP pays the naive O(n^d) trace evaluation. This is the Phase 6
+  stage-2/3 baseline: sumfac faces must beat 0.44 ms (assembled) while keeping the 0 MB footprint of the
+  6.59 ms naive path (face DOF traffic is ~3 MB vs the 280 MB side matrix, so the roofline is far below both).
 - `test_gimp_quadrature` / `test_cube_shape_functions` CheckOutput failures on CUDA + `test_volume` NVDB import error are pre-existing environmental noise (confirmed against pristine main).
 - Codex CLI works for implementation tasks with: `codex exec --skip-git-repo-check -m gpt-5.5 --config model_reasoning_effort="high" --sandbox danger-full-access -c approval_policy="never" -C /root/warp-DGNS "<prompt>" </dev/null` (bubblewrap sandboxing is non-functional in this container; `--full-auto` silently overrides the sandbox mode — do not pass it).
 - Orchestration pattern that worked: spec → implement (Codex or workflow agent) → direct-run test gates on cpu+cuda → adversarial review with refutation lenses → fix round → signed commit → push.
