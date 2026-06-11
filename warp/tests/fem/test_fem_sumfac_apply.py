@@ -139,7 +139,7 @@ def _is_sumfac_kernel(kernel):
     return getattr(kernel, "_wp_fem_sumfac_", False)
 
 
-def _check_apply_matches_naive(test, form, geo, degree, rng, values=None):
+def _check_apply_matches_naive(test, form, geo, degree, rng, values=None, assembly_options=None):
     """Sum-factorized apply on a random vector vs default-assembled BSR matrix-vector product."""
 
     space, _domain, test_field, trial_field, quadrature, x = _make_dg_case(geo, degree, rng)
@@ -165,6 +165,7 @@ def _check_apply_matches_naive(test, form, geo, degree, rng, values=None):
             values=values,
             output_dtype=wp.float64,
             assembly="sumfac",
+            assembly_options=assembly_options,
         )
     test.assertTrue(_is_sumfac_kernel(captured["kernel"]), "expected the sum-factorized kernel to be selected")
 
@@ -188,6 +189,20 @@ def test_apply_equals_naive_stiffness(test, device):
     with wp.ScopedDevice(device):
         _check_apply_matches_naive(test, stiffness_form, _make_grid_2d(), 4, rng)
         _check_apply_matches_naive(test, stiffness_form, _make_grid_3d(), 4, rng)
+
+
+def test_apply_equals_naive_element_batch(test, device):
+    """E_b > 1 wide-panel kernel matches the naive matrix on value-only and gradient forms.
+
+    Uses a single batch width (E_b = 2, dividing the 3x2 grid's 6 cells) so the
+    suite adds exactly one new tile-shape set; mass exercises the value-only
+    D stage, stiffness the gradient seeds and both restages.
+    """
+    rng = np.random.default_rng(54)
+    with wp.ScopedDevice(device):
+        opts = {"element_batch": 2}
+        _check_apply_matches_naive(test, mass_form, _make_grid_2d(), 4, rng, assembly_options=opts)
+        _check_apply_matches_naive(test, stiffness_form, _make_grid_2d(), 4, rng, assembly_options=opts)
 
 
 def test_apply_equals_naive_advection(test, device):
@@ -468,6 +483,64 @@ class TestFemSumfacApply(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "input field"):
             integrate_sumfac(rhs_only_form, {"v": test_field}, quadrature=quadrature)
 
+    def test_assembly_options_validation(self):
+        """assembly_options is validated host-side with descriptive errors (no compiles)."""
+
+        rng = np.random.default_rng(56)
+        geo = _make_grid_2d()
+        space, _domain, test_field, trial_field, quadrature, x = _make_dg_case(geo, 4, rng)
+        u = space.make_field()
+        u.dof_values = wp.array(x, dtype=wp.float64)
+        fields = {"u": u, "v": test_field}
+
+        def integrate_sumfac(**kwargs):
+            kwargs.setdefault("output_dtype", wp.float64)
+            return fem.integrate(mass_form, fields=fields, quadrature=quadrature, assembly="sumfac", **kwargs)
+
+        # Only assembly="sumfac" accepts assembly_options
+        with self.assertRaisesRegex(ValueError, "only supported with assembly='sumfac'"):
+            fem.integrate(
+                mass_form,
+                fields=fields,
+                quadrature=quadrature,
+                output_dtype=wp.float64,
+                assembly_options={"element_batch": 2},
+            )
+
+        # Unknown keys and invalid values are rejected
+        with self.assertRaisesRegex(ValueError, "Unknown assembly_options"):
+            integrate_sumfac(assembly_options={"elem_batch": 2})
+        with self.assertRaisesRegex(ValueError, "positive int"):
+            integrate_sumfac(assembly_options={"element_batch": 0})
+
+        # The batch must divide the element count (3x2 grid -> 6 cells)
+        with self.assertRaisesRegex(NotImplementedError, "divide the domain element count"):
+            integrate_sumfac(assembly_options={"element_batch": 4})
+
+        # 3D and bilinear element batching are not implemented
+        geo_3d = _make_grid_3d()
+        space_3d, _d3, test_3d, _t3, quadrature_3d, x_3d = _make_dg_case(geo_3d, 4, rng)
+        u_3d = space_3d.make_field()
+        u_3d.dof_values = wp.array(x_3d, dtype=wp.float64)
+        with self.assertRaisesRegex(NotImplementedError, "only implemented for 2D"):
+            fem.integrate(
+                mass_form,
+                fields={"u": u_3d, "v": test_3d},
+                quadrature=quadrature_3d,
+                output_dtype=wp.float64,
+                assembly="sumfac",
+                assembly_options={"element_batch": 2},
+            )
+        with self.assertRaisesRegex(NotImplementedError, "bilinear"):
+            fem.integrate(
+                mass_form,
+                fields={"u": trial_field, "v": test_field},
+                quadrature=quadrature,
+                output_dtype=wp.float64,
+                assembly="sumfac",
+                assembly_options={"element_batch": 2},
+            )
+
 
 add_function_test(
     TestFemSumfacApply, "test_apply_equals_naive_mass_2d", test_apply_equals_naive_mass_2d, devices=devices
@@ -480,6 +553,12 @@ add_function_test(
 )
 add_function_test(
     TestFemSumfacApply, "test_apply_equals_naive_advection", test_apply_equals_naive_advection, devices=devices
+)
+add_function_test(
+    TestFemSumfacApply,
+    "test_apply_equals_naive_element_batch",
+    test_apply_equals_naive_element_batch,
+    devices=devices,
 )
 add_function_test(
     TestFemSumfacApply,

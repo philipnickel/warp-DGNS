@@ -104,8 +104,9 @@ class SumfacNotApplicableError(NotImplementedError):
     """
 
 
-#: Panel width (elements per block). Only ``1`` is implemented for now; the
-#: ``E_b > 1`` wider-GEMM variant is a Phase 5 performance knob.
+#: Default panel width (elements per block). ``E_b > 1`` (wide-GEMM panels)
+#: is implemented for 2D linear cell forms and selected per call via
+#: ``integrate(..., assembly="sumfac", assembly_options={"element_batch": E_b})``.
 SUMFAC_ELEMENT_BATCH = 1
 
 # Operators through which the injected input field may be accessed: the
@@ -454,6 +455,21 @@ def make_sumfac_plan(
     """
     layout = find_sumfac_layout(integrand, arguments, test, quadrature, domain)
 
+    if element_batch < 1:
+        raise SumfacNotApplicableError(f"element_batch must be a positive int; got {element_batch}")
+    if element_batch > 1:
+        if layout.dim != 2:
+            raise NotImplementedError(
+                f"assembly_options['element_batch'] > 1 is currently only implemented for 2D cell domains; "
+                f"got a {layout.dim}D domain. Use element_batch=1 (the default) for 3D."
+            )
+        element_count = domain.element_count()
+        if element_count % element_batch != 0:
+            raise SumfacNotApplicableError(
+                f"assembly_options['element_batch']={element_batch} must divide the domain element count "
+                f"({element_count}); choose a divisor or use element_batch=1"
+            )
+
     interp, deriv = _build_1d_operator_matrices(test, layout)
 
     seed_field = SeedField.from_field(test)
@@ -796,7 +812,12 @@ def get_integrate_linear_sumfac_kernel(
         n: Nodes per axis of the (test and input) space, ``degree + 1``.
         q: Quadrature points per axis.
         dim: Spatial dimension (2 or 3).
-        element_batch: Elements per block; only ``1`` is implemented.
+        element_batch: Elements per block (``E_b``). With ``E_b > 1`` (2D
+            only) the contraction stages run as wide GEMM panels over the
+            batch, amortizing the per-shape padding of the underlying tile
+            GEMMs; the seeded D stage loops over the batched elements'
+            quadrature points. The launch grid shrinks to
+            ``element_count // E_b`` blocks.
         test_uses_grad: Whether the integrand applies a gradient operator to
             the test field. When ``False`` the gradient seeds and the ``f1``
             contractions are omitted entirely, matching the legacy dispatch
@@ -805,8 +826,8 @@ def get_integrate_linear_sumfac_kernel(
         accumulate_dtype: Scalar type used for the tile contractions and
             coefficient accumulation.
     """
-    if element_batch != 1:
-        raise NotImplementedError("Sum-factorized integration currently requires element_batch == 1")
+    if element_batch != 1 and dim != 2:
+        raise NotImplementedError("Sum-factorized integration with element_batch > 1 is only implemented in 2D")
 
     SampleType = domain.geometry.sample_type
     value_type = injected_field.dtype
@@ -827,6 +848,135 @@ def get_integrate_linear_sumfac_kernel(
     q_c = wp.constant(q)
     nn_c = wp.constant(n * n)
     qq_c = wp.constant(q * q)
+
+    if dim == 2 and element_batch > 1:
+        # Wide-panel (E_b) variant: every contraction stage is one wide GEMM
+        # over the element batch, with per-element transpose restaging between
+        # stages. The B^T stage runs directly on the TRANSPOSED coefficient
+        # blocks: (op_t f op)^T = op_t f^T op has the same form, so only two
+        # restages are needed and the result lands in natural layout. The
+        # strided tile_views feed only tile_assign (never tile_matmul), which
+        # is the documented-sound subset. Validated against the per-element
+        # kernel by the oracle tests and the design/spike_cutile_sumfac
+        # benchmarks (cuBLASDx padding 2.64x -> 1.70x, -25% ms/apply at P=4).
+        q2_c = wp.constant(2 * q)
+        eb_c = wp.constant(element_batch)
+        neb_c = wp.constant(n * element_batch)
+        q2eb_c = wp.constant(2 * q * element_batch)
+        ebqq_c = wp.constant(element_batch * q * q)
+
+        def integrate_kernel_fn(
+            qp_arg: quadrature.Arg,
+            domain_arg: domain.ElementArg,
+            domain_index_arg: domain.ElementIndexArg,
+            fields: FieldStruct,
+            values: ValueStruct,
+            input_eval_arg: input_field.EvalArg,
+            interp: wp.array2d(dtype=accumulate_dtype),
+            deriv: wp.array2d(dtype=accumulate_dtype),
+            result_elem: wp.array2d(dtype=accumulate_dtype),
+        ):
+            block_index = wp.tid()
+
+            # Stacked operator [A; D_hat]: one (2q, n) tile drives every stage
+            a_tile = wp.tile_load(interp, shape=(q_c, n_c))
+            d_tile = wp.tile_load(deriv, shape=(q_c, n_c))
+            op = wp.tile_zeros(shape=(q2_c, n_c), dtype=accumulate_dtype)
+            wp.tile_assign(op, a_tile, offset=(0, 0))
+            wp.tile_assign(op, d_tile, offset=(q_c, 0))
+            op_t = wp.tile_transpose(op)
+
+            # --- B stage: gather the E_b element DOF tensors into column
+            # panels of a single (n, n*E_b) tile, then contract all elements
+            # in one wide GEMM per stage.
+            u_cat = wp.tile_zeros(shape=(n_c, neb_c), dtype=accumulate_dtype)
+            for e in range(eb_c):
+                element_index_e = domain.element_index(domain_index_arg, block_index * eb_c + e)
+                u_flat = wp.tile_load(input_eval_arg.dof_values, shape=(nn_c,), offset=(element_index_e * nn_c,))
+                u_mat = wp.tile_astype(wp.tile_reshape(u_flat, shape=(n_c, n_c)), dtype=accumulate_dtype)
+                wp.tile_assign(u_cat, u_mat, offset=(0, e * n_c))
+
+            t = wp.tile_matmul(op, u_cat)  # (2q, n*E_b): t_e column blocks
+            # Restage to t_e^T blocks so the second contraction is also a wide
+            # LEFT multiply: s_e^T = op @ t_e^T.
+            tt = wp.tile_zeros(shape=(n_c, q2eb_c), dtype=accumulate_dtype)
+            for e in range(eb_c):
+                wp.tile_assign(
+                    tt,
+                    wp.tile_transpose(wp.tile_view(t, offset=(0, e * n_c), shape=(q2_c, n_c))),
+                    offset=(0, e * q2_c),
+                )
+            st = wp.tile_matmul(op, tt)  # (2q, 2q*E_b): s_e^T blocks
+
+            # --- D stage: seeded integrand evaluations per quadrature point,
+            # reading/writing the TRANSPOSED channel blocks: s_e[a, b] lives
+            # at st[b, e*2q + a] and f_e[a, b] is written to ft[b, e*2q + a].
+            ft = wp.tile_zeros(shape=(q2_c, q2eb_c), dtype=accumulate_dtype)
+
+            qp_fields = FieldStruct()
+            _copy_qp_fields()
+
+            for it in range(ebqq_c):
+                e = it // qq_c
+                qp = it - e * qq_c
+                qx = qp // q_c
+                qy = qp - qx * q_c
+                col = e * q2_c
+                domain_element_index = block_index * eb_c + e
+                element_index = domain.element_index(domain_index_arg, domain_element_index)
+                qp_index = quadrature.point_index(domain_arg, qp_arg, domain_element_index, element_index, qp)
+                qp_coords = quadrature.point_coords(domain_arg, qp_arg, domain_element_index, element_index, qp)
+                qp_weight = quadrature.point_weight(domain_arg, qp_arg, domain_element_index, element_index, qp)
+
+                free_sample = make_free_sample(element_index, qp_coords)
+                vol = domain.element_measure(domain_arg, free_sample)
+                scale = accumulate_dtype(qp_weight * vol)
+                jac = domain.element_deformation_gradient(domain_arg, free_sample)
+                jac_inv = wp.inverse(jac)
+
+                # Inject the B-stage interpolated value and physical gradient
+                inj_arg = InjectedEvalArg()
+                inj_arg.value = value_type(st[qy, col + qx])
+                g_ref = grad_type(value_type(st[qy, col + q_c + qx]), value_type(st[q_c + qy, col + qx]))
+                inj_arg.gradient = wp.transpose(jac_inv) * g_ref
+                _set_injected_eval_arg()
+
+                # Value seed (v = 1, grad v = 0) -> f0 block
+                sample = SampleType(element_index, qp_coords, qp_index, qp_weight, DofIndex(0, 0), NULL_DOF_INDEX)
+                ft[qy, col + qx] = scale * accumulate_dtype(integrand_func(sample, qp_fields, values))
+
+                # Gradient seeds (v = 0, grad v = e_i) -> f1 blocks; the seeds
+                # are physical, so map back to reference space with J^{-1}.
+                if wp.static(test_uses_grad):
+                    f1_phys = grad_type()
+                    for seed in range(2):
+                        sample = SampleType(
+                            element_index, qp_coords, qp_index, qp_weight, DofIndex(seed + 1, 0), NULL_DOF_INDEX
+                        )
+                        f1_phys[seed] = value_type(integrand_func(sample, qp_fields, values))
+                    f1_ref = jac_inv * f1_phys
+                    ft[qy, col + q_c + qx] = scale * accumulate_dtype(f1_ref[0])
+                    ft[q_c + qy, col + qx] = scale * accumulate_dtype(f1_ref[1])
+
+            # --- B^T stage on the transposed blocks: g_e = op_t @ f_e^T, then
+            # r_e = op_t @ g_e^T = op_t f_e op (one restage, natural layout).
+            g = wp.tile_matmul(op_t, ft)  # (n, 2q*E_b)
+            gt = wp.tile_zeros(shape=(q2_c, neb_c), dtype=accumulate_dtype)
+            for e in range(eb_c):
+                wp.tile_assign(
+                    gt,
+                    wp.tile_transpose(wp.tile_view(g, offset=(0, e * q2_c), shape=(n_c, q2_c))),
+                    offset=(0, e * n_c),
+                )
+            r = wp.tile_matmul(op_t, gt)  # (n, n*E_b): r_e blocks
+
+            r_tmp = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)
+            for e in range(eb_c):
+                wp.tile_assign(r_tmp, wp.tile_view(r, offset=(0, e * n_c), shape=(n_c, n_c)), offset=(0, 0))
+                r_flat = wp.tile_reshape(r_tmp, shape=(1, nn_c))
+                wp.tile_store(result_elem, r_flat, offset=(block_index * eb_c + e, 0))
+
+        return integrate_kernel_fn
 
     if dim == 2:
         q2_c = wp.constant(2 * q)

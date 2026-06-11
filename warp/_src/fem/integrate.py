@@ -1933,7 +1933,7 @@ def _launch_integrate_kernel(
 
             wp.launch_tiled(
                 kernel,
-                dim=[element_count],
+                dim=[element_count // sumfac_plan.element_batch],
                 inputs=[
                     qp_arg,
                     domain_elt_arg,
@@ -2405,6 +2405,7 @@ def integrate(
     assembly: str | None = None,
     add: bool = False,
     bsr_options: dict[str, Any] | None = None,
+    assembly_options: dict[str, Any] | None = None,
 ):
     """
     Integrates a constant, linear or bilinear form, and returns a scalar, array, or sparse matrix, respectively.
@@ -2440,6 +2441,13 @@ def integrate(
           :func:`warp.sparse.bsr_compress()`. For row compression, :func:`warp.sparse.bsr_compress()`
           uses ``inplace=False`` when ``output.values.requires_grad`` is true; non-differentiable outputs use
           in-place compression for the lowest memory overhead.
+        assembly_options: Additional options for the selected assembly strategy. Only supported with
+          ``assembly="sumfac"``, where ``element_batch`` (default ``1``) selects the number of elements
+          processed per block by the fused linear cell kernel: with ``element_batch=E_b > 1`` the
+          contraction stages run as wide GEMM panels over ``E_b`` elements, amortizing the per-shape
+          padding of the underlying tile GEMMs. ``E_b > 1`` is currently implemented for 2D linear cell
+          forms only and requires the domain element count to be divisible by ``E_b``; unsupported
+          combinations raise a descriptive error (no silent fallback).
     """
     if fields is None:
         fields = {}
@@ -2490,6 +2498,9 @@ def integrate(
     assembly = _pick_assembly_strategy(assembly, arguments=arguments, operators=integrand.operators)
     # print("assembly for ", integrand.name, ":", strategy)
 
+    if assembly_options is not None and assembly != "sumfac":
+        raise ValueError(f"assembly_options is only supported with assembly='sumfac'; got assembly={assembly!r}")
+
     sumfac_plan = None
     if assembly != "nodal":
         if quadrature is None:
@@ -2511,11 +2522,34 @@ def integrate(
             _validate_sumfac_request(
                 domain, test, trial, quadrature, output, kernel_options, accumulate_dtype, arguments.field_args
             )
+
+            sumfac_options = dict(assembly_options or {})
+            element_batch = sumfac_options.pop("element_batch", 1)
+            if sumfac_options:
+                raise ValueError(
+                    f"Unknown assembly_options keys for assembly='sumfac': {sorted(sumfac_options)}; "
+                    "supported keys: 'element_batch'"
+                )
+            if not isinstance(element_batch, int) or element_batch < 1:
+                raise ValueError(f"assembly_options['element_batch'] must be a positive int; got {element_batch!r}")
+
             if domain.element_kind == ElementKind.SIDE:
+                if element_batch != 1:
+                    raise NotImplementedError(
+                        "assembly_options['element_batch'] > 1 is not implemented for side (DG face) domains; "
+                        "only the linear cell apply supports element batching"
+                    )
                 sumfac_plan = sumfac_side_kernels.make_sumfac_side_plan(integrand, arguments, test, quadrature, domain)
             elif trial is None:
-                sumfac_plan = sumfac_kernels.make_sumfac_plan(integrand, arguments, test, quadrature, domain)
+                sumfac_plan = sumfac_kernels.make_sumfac_plan(
+                    integrand, arguments, test, quadrature, domain, element_batch=element_batch
+                )
             else:
+                if element_batch != 1:
+                    raise NotImplementedError(
+                        "assembly_options['element_batch'] > 1 is not implemented for bilinear (assembly) forms; "
+                        "only the linear cell apply supports element batching"
+                    )
                 sumfac_plan = sumfac_kernels.make_sumfac_bilinear_plan(
                     integrand, arguments, test, trial, quadrature, domain
                 )

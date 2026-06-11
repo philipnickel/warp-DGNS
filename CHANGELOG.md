@@ -28,7 +28,10 @@
   sum-factorized face traces, enabling fully matrix-free DG operators (e.g. SIPG diffusion: sum-factorized volume apply
   plus sum-factorized interior-penalty flux apply); bilinear side forms keep using the default assembly. The
   sum-factorized side apply is around 5x faster than its first release (stacked face-trace operators, per-face
-  geometry hoisting, launch-plan caching).
+  geometry hoisting, launch-plan caching). The fused linear cell apply additionally supports element batching via
+  `fem.integrate(..., assembly="sumfac", assembly_options={"element_batch": E_b})` (2D only): the contraction stages
+  run as wide GEMM panels over `E_b` elements per block, reducing the per-shape padding of the underlying tile GEMMs;
+  unsupported combinations (3D, bilinear, side forms, non-divisible element counts) raise a descriptive error.
 
 ### Removed
 
