@@ -169,6 +169,77 @@ def _make_qfunction_eval_kernel_fn(
     return qfunction_eval_kernel_fn
 
 
+def make_qfunction_ref_eval_kernel_fn(
+    integrand_func: wp.Function,
+    domain: GeometryDomain,
+    quadrature: Quadrature,
+    FieldStruct: type,
+    ValueStruct: type,
+    accumulate_dtype,
+    test_uses_grad: bool,
+):
+    """Build the kernel body extracting REFERENCE-space, geometry-folded coefficients.
+
+    Variant of :func:`_make_qfunction_eval_kernel_fn` for the fused
+    ``assembly="sumfac"`` pipeline (``assembly_options={"qfunction":
+    "extracted"}``): one thread per quadrature point (no block-redundant
+    work), geometry evaluated per point (curved/non-affine elements are fully
+    supported), and the output laid out for direct tile consumption by the
+    ``B^T`` contraction kernel: ``fq[element, 0, qp] = w |J| f0`` and
+    ``fq[element, 1 + i, qp] = w |J| (J^{-1} f1_phys)[i]`` (reference-space
+    gradient channels; omitted entirely when ``test_uses_grad`` is False).
+    """
+
+    SampleType = domain.geometry.sample_type
+    scalar_type = domain.geometry.scalar_type
+    GRAD_DIM = domain.geometry.dimension
+    grad_vec_type = cache.cached_vec_type(length=GRAD_DIM, dtype=scalar_type)
+
+    def qfunction_ref_eval_kernel_fn(
+        qp_arg: quadrature.Arg,
+        domain_arg: domain.ElementArg,
+        domain_index_arg: domain.ElementIndexArg,
+        fields: FieldStruct,
+        values: ValueStruct,
+        fq: wp.array3d(dtype=accumulate_dtype),
+    ):
+        domain_element_index, qp = wp.tid()
+
+        element_index = domain.element_index(domain_index_arg, domain_element_index)
+        qp_point_count = quadrature.point_count(domain_arg, qp_arg, domain_element_index, element_index)
+        if qp >= qp_point_count:
+            return
+
+        qp_index = quadrature.point_index(domain_arg, qp_arg, domain_element_index, element_index, qp)
+        qp_coords = quadrature.point_coords(domain_arg, qp_arg, domain_element_index, element_index, qp)
+        qp_weight = quadrature.point_weight(domain_arg, qp_arg, domain_element_index, element_index, qp)
+
+        free_sample = make_free_sample(element_index, qp_coords)
+        vol = domain.element_measure(domain_arg, free_sample)
+        scale = scalar_type(qp_weight) * vol
+
+        # Value seed (v = 1, grad v = 0) -> channel 0
+        sample = SampleType(element_index, qp_coords, qp_index, qp_weight, DofIndex(0, 0), NULL_DOF_INDEX)
+        fq[domain_element_index, 0, qp] = accumulate_dtype(scale * scalar_type(integrand_func(sample, fields, values)))
+
+        # Gradient seeds (v = 0, grad v = e_i) -> channels 1..d, mapped to
+        # reference space with the per-point J^{-1} (curvilinear-correct).
+        if wp.static(test_uses_grad):
+            jac = domain.element_deformation_gradient(domain_arg, free_sample)
+            jac_inv = wp.inverse(jac)
+            f1_phys = grad_vec_type()
+            for seed in range(GRAD_DIM):
+                sample = SampleType(
+                    element_index, qp_coords, qp_index, qp_weight, DofIndex(seed + 1, 0), NULL_DOF_INDEX
+                )
+                f1_phys[seed] = scalar_type(integrand_func(sample, fields, values))
+            f1_ref = jac_inv * f1_phys
+            for k in range(GRAD_DIM):
+                fq[domain_element_index, 1 + k, qp] = accumulate_dtype(scale * f1_ref[k])
+
+    return qfunction_ref_eval_kernel_fn
+
+
 def _get_qfunction_kernel(
     integrand: Integrand,
     domain: GeometryDomain,

@@ -1316,6 +1316,7 @@ def _generate_integrate_kernel(
         else:
             kernel_suffix = (
                 "sumfac",
+                sumfac_plan.qfunction,
                 sumfac_plan.element_batch,
                 sumfac_plan.n,
                 sumfac_plan.q,
@@ -1411,6 +1412,28 @@ def _generate_integrate_kernel(
                 )
                 # Both seed selectors travel through the Sample, so the kernel's
                 # `fields` argument is passed to the integrand unchanged.
+                code_transformers = [
+                    PassFieldArgsToIntegrand(
+                        arg_names=integrand.argspec.args,
+                        parsed_args=arguments,
+                        integrand_func=integrand_func,
+                    ),
+                ]
+            elif sumfac_plan.qfunction == "extracted":
+                from warp._src.fem.sumfac import qfunction as sumfac_qfunction  # noqa: PLC0415 (circular import)
+
+                # The generated kernel is the one-thread-per-quadrature-point
+                # extraction kernel; the integrand-independent B^T consume
+                # kernel is fetched separately at launch time.
+                integrate_kernel_fn = sumfac_qfunction.make_qfunction_ref_eval_kernel_fn(
+                    integrand_func,
+                    domain,
+                    quadrature,
+                    FieldStruct,
+                    ValueStruct,
+                    accumulate_dtype=accumulate_dtype,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                )
                 code_transformers = [
                     PassFieldArgsToIntegrand(
                         arg_names=integrand.argspec.args,
@@ -1921,8 +1944,6 @@ def _launch_integrate_kernel(
             nodes_per_element = sumfac_plan.nodes_per_element
 
             interp_arr, deriv_arr = sumfac_plan.operator_arrays(accumulate_dtype, device)
-            input_eval_arg = sumfac_plan.input_field.EvalArg()
-            sumfac_plan.input_field.fill_eval_arg(input_eval_arg, device)
 
             staging = cache.borrow_temporary(
                 temporary_store,
@@ -1931,23 +1952,69 @@ def _launch_integrate_kernel(
                 device=device,
             )
 
-            wp.launch_tiled(
-                kernel,
-                dim=[element_count // sumfac_plan.element_batch],
-                inputs=[
-                    qp_arg,
-                    domain_elt_arg,
-                    domain_elt_index_arg,
-                    field_arg_values,
-                    value_struct_values,
-                    input_eval_arg,
-                    interp_arr,
-                    deriv_arr,
-                    staging,
-                ],
-                block_dim=sumfac_kernels.sumfac_block_dim(device),
-                device=device,
-            )
+            if sumfac_plan.qfunction == "extracted":
+                # Two-kernel D-stage: `kernel` is the one-thread-per-quadrature-
+                # point extraction kernel (curvilinear-correct per-point
+                # geometry, no block-redundant work); the integrand-independent
+                # B^T consume kernel contracts the coefficient arrays.
+                points_per_element = sumfac_plan.q**sumfac_plan.dim
+                channels = 1 + (sumfac_plan.dim if sumfac_plan.test_uses_grad else 0)
+                fq = cache.borrow_temporary(
+                    temporary_store,
+                    shape=(element_count, channels, points_per_element),
+                    dtype=accumulate_dtype,
+                    device=device,
+                )
+                wp.launch(
+                    kernel,
+                    dim=(element_count, points_per_element),
+                    inputs=[
+                        qp_arg,
+                        domain_elt_arg,
+                        domain_elt_index_arg,
+                        field_arg_values,
+                        value_struct_values,
+                        fq,
+                    ],
+                    device=device,
+                )
+                consume_kernel = sumfac_kernels.get_sumfac_qf_consume_kernel(
+                    n=sumfac_plan.n,
+                    q=sumfac_plan.q,
+                    dim=sumfac_plan.dim,
+                    element_batch=sumfac_plan.element_batch,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                    accumulate_dtype=accumulate_dtype,
+                )
+                wp.launch_tiled(
+                    consume_kernel,
+                    dim=[element_count // sumfac_plan.element_batch],
+                    inputs=[fq, interp_arr, deriv_arr, staging],
+                    block_dim=sumfac_kernels.sumfac_block_dim(device),
+                    device=device,
+                )
+                fq.release()
+            else:
+                input_eval_arg = sumfac_plan.input_field.EvalArg()
+                sumfac_plan.input_field.fill_eval_arg(input_eval_arg, device)
+
+                wp.launch_tiled(
+                    kernel,
+                    dim=[element_count // sumfac_plan.element_batch],
+                    inputs=[
+                        qp_arg,
+                        domain_elt_arg,
+                        domain_elt_index_arg,
+                        field_arg_values,
+                        value_struct_values,
+                        input_eval_arg,
+                        interp_arr,
+                        deriv_arr,
+                        staging,
+                    ],
+                    block_dim=sumfac_kernels.sumfac_block_dim(device),
+                    device=device,
+                )
 
             scatter_kernel = sumfac_kernels.get_sumfac_scatter_kernel(
                 domain,
@@ -2442,12 +2509,18 @@ def integrate(
           uses ``inplace=False`` when ``output.values.requires_grad`` is true; non-differentiable outputs use
           in-place compression for the lowest memory overhead.
         assembly_options: Additional options for the selected assembly strategy. Only supported with
-          ``assembly="sumfac"``, where ``element_batch`` (default ``1``) selects the number of elements
-          processed per block by the fused linear cell kernel: with ``element_batch=E_b > 1`` the
-          contraction stages run as wide GEMM panels over ``E_b`` elements, amortizing the per-shape
-          padding of the underlying tile GEMMs. ``E_b > 1`` is currently implemented for 2D linear cell
-          forms only and requires the domain element count to be divisible by ``E_b``; unsupported
-          combinations raise a descriptive error (no silent fallback).
+          ``assembly="sumfac"``; unsupported combinations raise a descriptive error (no silent fallback).
+          ``element_batch`` (default ``1``) selects the number of elements processed per block by the fused
+          linear cell kernel: with ``element_batch=E_b > 1`` the contraction stages run as wide GEMM panels
+          over ``E_b`` elements, amortizing the per-shape padding of the underlying tile GEMMs; currently 2D
+          linear cell forms only, and the domain element count must be divisible by ``E_b``.
+          ``qfunction`` (default ``"seeded"``) selects the D-stage strategy of the linear cell apply:
+          ``"seeded"`` evaluates the integrand inside the fused kernel (each block evaluates its elements'
+          quadrature points redundantly on every thread), while ``"extracted"`` first runs a
+          one-thread-per-quadrature-point extraction kernel (geometry evaluated per point, so curved and
+          non-affine elements are fully supported) and then contracts the extracted coefficient arrays with
+          an integrand-independent ``B^T`` tile kernel; currently 2D linear cell forms only. Both options
+          compose (``{"element_batch": 4, "qfunction": "extracted"}``).
     """
     if fields is None:
         fields = {}
@@ -2525,13 +2598,16 @@ def integrate(
 
             sumfac_options = dict(assembly_options or {})
             element_batch = sumfac_options.pop("element_batch", 1)
+            qfunction = sumfac_options.pop("qfunction", "seeded")
             if sumfac_options:
                 raise ValueError(
                     f"Unknown assembly_options keys for assembly='sumfac': {sorted(sumfac_options)}; "
-                    "supported keys: 'element_batch'"
+                    "supported keys: 'element_batch', 'qfunction'"
                 )
             if not isinstance(element_batch, int) or element_batch < 1:
                 raise ValueError(f"assembly_options['element_batch'] must be a positive int; got {element_batch!r}")
+            if qfunction not in ("seeded", "extracted"):
+                raise ValueError(f"assembly_options['qfunction'] must be 'seeded' or 'extracted'; got {qfunction!r}")
 
             if domain.element_kind == ElementKind.SIDE:
                 if element_batch != 1:
@@ -2539,16 +2615,26 @@ def integrate(
                         "assembly_options['element_batch'] > 1 is not implemented for side (DG face) domains; "
                         "only the linear cell apply supports element batching"
                     )
+                if qfunction != "seeded":
+                    raise NotImplementedError(
+                        "assembly_options['qfunction']='extracted' is not implemented for side (DG face) domains; "
+                        "only the linear cell apply supports the extracted D stage"
+                    )
                 sumfac_plan = sumfac_side_kernels.make_sumfac_side_plan(integrand, arguments, test, quadrature, domain)
             elif trial is None:
                 sumfac_plan = sumfac_kernels.make_sumfac_plan(
-                    integrand, arguments, test, quadrature, domain, element_batch=element_batch
+                    integrand, arguments, test, quadrature, domain, element_batch=element_batch, qfunction=qfunction
                 )
             else:
                 if element_batch != 1:
                     raise NotImplementedError(
                         "assembly_options['element_batch'] > 1 is not implemented for bilinear (assembly) forms; "
                         "only the linear cell apply supports element batching"
+                    )
+                if qfunction != "seeded":
+                    raise NotImplementedError(
+                        "assembly_options['qfunction']='extracted' is not implemented for bilinear (assembly) "
+                        "forms; only the linear cell apply supports the extracted D stage"
                     )
                 sumfac_plan = sumfac_kernels.make_sumfac_bilinear_plan(
                     integrand, arguments, test, trial, quadrature, domain

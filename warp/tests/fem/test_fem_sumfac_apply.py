@@ -205,6 +205,27 @@ def test_apply_equals_naive_element_batch(test, device):
         _check_apply_matches_naive(test, stiffness_form, _make_grid_2d(), 4, rng, assembly_options=opts)
 
 
+def test_apply_equals_naive_qfunction_extracted(test, device):
+    """The extracted (two-kernel) D stage matches the naive matrix, including curvilinear elements.
+
+    The vertex-perturbed Quadmesh2D case is the curvilinear gate: J varies per
+    quadrature point, so the extraction kernel's per-point geometry folding
+    (scale and J^-1) is exercised for real. Also composes with element_batch.
+    """
+    rng = np.random.default_rng(57)
+    with wp.ScopedDevice(device):
+        opts = {"qfunction": "extracted"}
+        _check_apply_matches_naive(test, mass_form, _make_grid_2d(), 4, rng, assembly_options=opts)
+        _check_apply_matches_naive(test, stiffness_form, _make_grid_2d(), 4, rng, assembly_options=opts)
+
+        positions, quad_vidx = _gen_nonaffine_quadmesh(3, 2, rng)
+        geo = fem.Quadmesh2D(quad_vertex_indices=quad_vidx, positions=positions)
+        _check_apply_matches_naive(test, stiffness_form, geo, 4, rng, assembly_options=opts)
+
+        opts_eb = {"qfunction": "extracted", "element_batch": 2}
+        _check_apply_matches_naive(test, stiffness_form, _make_grid_2d(), 4, rng, assembly_options=opts_eb)
+
+
 def test_apply_equals_naive_advection(test, device):
     rng = np.random.default_rng(53)
     with wp.ScopedDevice(device):
@@ -517,6 +538,10 @@ class TestFemSumfacApply(unittest.TestCase):
         with self.assertRaisesRegex(NotImplementedError, "divide the domain element count"):
             integrate_sumfac(assembly_options={"element_batch": 4})
 
+        # qfunction values are validated; 'extracted' is 2D-only
+        with self.assertRaisesRegex(ValueError, "'seeded' or 'extracted'"):
+            integrate_sumfac(assembly_options={"qfunction": "fused"})
+
         # 3D and bilinear element batching are not implemented
         geo_3d = _make_grid_3d()
         space_3d, _d3, test_3d, _t3, quadrature_3d, x_3d = _make_dg_case(geo_3d, 4, rng)
@@ -530,6 +555,15 @@ class TestFemSumfacApply(unittest.TestCase):
                 output_dtype=wp.float64,
                 assembly="sumfac",
                 assembly_options={"element_batch": 2},
+            )
+        with self.assertRaisesRegex(NotImplementedError, "only implemented for 2D"):
+            fem.integrate(
+                mass_form,
+                fields={"u": u_3d, "v": test_3d},
+                quadrature=quadrature_3d,
+                output_dtype=wp.float64,
+                assembly="sumfac",
+                assembly_options={"qfunction": "extracted"},
             )
         with self.assertRaisesRegex(NotImplementedError, "bilinear"):
             fem.integrate(
@@ -558,6 +592,12 @@ add_function_test(
     TestFemSumfacApply,
     "test_apply_equals_naive_element_batch",
     test_apply_equals_naive_element_batch,
+    devices=devices,
+)
+add_function_test(
+    TestFemSumfacApply,
+    "test_apply_equals_naive_qfunction_extracted",
+    test_apply_equals_naive_qfunction_extracted,
     devices=devices,
 )
 add_function_test(

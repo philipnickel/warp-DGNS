@@ -193,7 +193,12 @@ class SumfacPlan(_SumfacPlanBase):
     input_name: str
     input_field: NodalField
     seed_field: SeedField
-    injected_field: ValueInjectedField
+    injected_field: ValueInjectedField | None
+    #: D-stage strategy: "seeded" evaluates the integrand in-kernel
+    #: (block-redundant); "extracted" runs a one-thread-per-quadrature-point
+    #: extraction kernel first and the fused kernel consumes the coefficient
+    #: arrays with pure tile ops (no in-kernel integrand calls).
+    qfunction: str = "seeded"
 
 
 _operator_array_cache: dict[Any, tuple[wp.array, wp.array]] = {}
@@ -443,6 +448,7 @@ def make_sumfac_plan(
     quadrature: Quadrature,
     domain: GeometryDomain,
     element_batch: int = SUMFAC_ELEMENT_BATCH,
+    qfunction: str = "seeded",
 ) -> SumfacPlan:
     """Build the launch plan and substitute the seed/injected fields in ``arguments``.
 
@@ -470,12 +476,27 @@ def make_sumfac_plan(
                 f"({element_count}); choose a divisor or use element_batch=1"
             )
 
+    if qfunction not in ("seeded", "extracted"):
+        raise ValueError(f"assembly_options['qfunction'] must be 'seeded' or 'extracted'; got {qfunction!r}")
+    if qfunction == "extracted" and layout.dim != 2:
+        raise NotImplementedError(
+            "assembly_options['qfunction']='extracted' is currently only implemented for 2D cell domains; "
+            f"got a {layout.dim}D domain. Use the default 'seeded' D stage for 3D."
+        )
+
     interp, deriv = _build_1d_operator_matrices(test, layout)
 
     seed_field = SeedField.from_field(test)
-    injected_field = ValueInjectedField.from_field(layout.input_field, domain)
     arguments.field_args[arguments.test_name] = seed_field
-    arguments.field_args[layout.input_name] = injected_field
+    if qfunction == "extracted":
+        # The extraction kernel evaluates the input field through its native
+        # machinery (one thread per quadrature point), so the field is NOT
+        # replaced by a ValueInjectedField; the consume kernel never calls the
+        # integrand at all.
+        injected_field = None
+    else:
+        injected_field = ValueInjectedField.from_field(layout.input_field, domain)
+        arguments.field_args[layout.input_name] = injected_field
 
     return SumfacPlan(
         test=test,
@@ -492,6 +513,7 @@ def make_sumfac_plan(
         interp=interp,
         deriv=deriv,
         test_uses_grad=layout.test_uses_grad,
+        qfunction=qfunction,
     )
 
 
@@ -1656,6 +1678,107 @@ def set_block_diagonal_topology(matrix, nodes_per_element: int) -> int:
         device=matrix.device,
     )
     return nnz
+
+
+def get_sumfac_qf_consume_kernel(
+    *,
+    n: int,
+    q: int,
+    dim: int,
+    element_batch: int,
+    test_uses_grad: bool,
+    accumulate_dtype,
+):
+    """Build (and cache) the ``B^T`` kernel consuming extracted Q-function coefficients.
+
+    Counterpart of the seeded fused kernel for
+    ``assembly_options={"qfunction": "extracted"}``: the D stage already
+    happened in the one-thread-per-quadrature-point extraction kernel
+    (reference-space, geometry-folded coefficients in ``fq``), so this kernel
+    is integrand-INDEPENDENT — pure tile loads and wide GEMM contractions,
+    shared across all integrands of the same shape. Uses the same transposed
+    wide-panel block algebra as the seeded ``element_batch`` kernel
+    (``(op^T f op)^T = op^T f^T op``); works for any ``element_batch >= 1``.
+
+    Args:
+        n: Nodes per axis, ``degree + 1``.
+        q: Quadrature points per axis.
+        dim: Spatial dimension (only 2 is implemented).
+        element_batch: Elements per block (``E_b``).
+        test_uses_grad: Whether gradient channels are present in ``fq``.
+        accumulate_dtype: Scalar type of ``fq``, the operators, and the staging.
+    """
+    if dim != 2:
+        raise NotImplementedError("The extracted-qfunction consume kernel is only implemented in 2D")
+
+    n_c = wp.constant(n)
+    q_c = wp.constant(q)
+    nn_c = wp.constant(n * n)
+    qq_c = wp.constant(q * q)
+    q2_c = wp.constant(2 * q)
+    eb_c = wp.constant(element_batch)
+    neb_c = wp.constant(n * element_batch)
+    q2eb_c = wp.constant(2 * q * element_batch)
+
+    @cache.dynamic_kernel(
+        suffix=(
+            "sumfac_qf_consume",
+            n,
+            q,
+            dim,
+            element_batch,
+            bool(test_uses_grad),
+            cache.pod_type_key(accumulate_dtype),
+        ),
+        kernel_options={"enable_backward": False},
+    )
+    def sumfac_qf_consume_kernel(
+        fq: wp.array3d(dtype=accumulate_dtype),
+        interp: wp.array2d(dtype=accumulate_dtype),
+        deriv: wp.array2d(dtype=accumulate_dtype),
+        result_elem: wp.array2d(dtype=accumulate_dtype),
+    ):
+        block_index = wp.tid()
+
+        a_tile = wp.tile_load(interp, shape=(q_c, n_c))
+        d_tile = wp.tile_load(deriv, shape=(q_c, n_c))
+        op = wp.tile_zeros(shape=(q2_c, n_c), dtype=accumulate_dtype)
+        wp.tile_assign(op, a_tile, offset=(0, 0))
+        wp.tile_assign(op, d_tile, offset=(q_c, 0))
+        op_t = wp.tile_transpose(op)
+
+        # Assemble the transposed coefficient blocks f_e^T from the extracted
+        # channels: f_e[qx, qy] lives at ft[qy, e*2q + qx] (value), with the
+        # reference-gradient channels at the [.., +q] block offsets.
+        ft = wp.tile_zeros(shape=(q2_c, q2eb_c), dtype=accumulate_dtype)
+        for e in range(eb_c):
+            de = block_index * eb_c + e
+            c0 = wp.tile_reshape(wp.tile_load(fq[de], shape=(1, qq_c), offset=(0, 0)), shape=(q_c, q_c))
+            wp.tile_assign(ft, wp.tile_transpose(c0), offset=(0, e * q2_c))
+            if wp.static(test_uses_grad):
+                c1 = wp.tile_reshape(wp.tile_load(fq[de], shape=(1, qq_c), offset=(1, 0)), shape=(q_c, q_c))
+                wp.tile_assign(ft, wp.tile_transpose(c1), offset=(0, e * q2_c + q_c))
+                c2 = wp.tile_reshape(wp.tile_load(fq[de], shape=(1, qq_c), offset=(2, 0)), shape=(q_c, q_c))
+                wp.tile_assign(ft, wp.tile_transpose(c2), offset=(q_c, e * q2_c))
+
+        # B^T on transposed blocks: g_e = op_t @ f_e^T, r_e = op_t @ g_e^T.
+        g = wp.tile_matmul(op_t, ft)  # (n, 2q*E_b)
+        gt = wp.tile_zeros(shape=(q2_c, neb_c), dtype=accumulate_dtype)
+        for e in range(eb_c):
+            wp.tile_assign(
+                gt,
+                wp.tile_transpose(wp.tile_view(g, offset=(0, e * q2_c), shape=(n_c, q2_c))),
+                offset=(0, e * n_c),
+            )
+        r = wp.tile_matmul(op_t, gt)  # (n, n*E_b): r_e blocks, natural layout
+
+        r_tmp = wp.tile_zeros(shape=(n_c, n_c), dtype=accumulate_dtype)
+        for e in range(eb_c):
+            wp.tile_assign(r_tmp, wp.tile_view(r, offset=(0, e * n_c), shape=(n_c, n_c)), offset=(0, 0))
+            r_flat = wp.tile_reshape(r_tmp, shape=(1, nn_c))
+            wp.tile_store(result_elem, r_flat, offset=(block_index * eb_c + e, 0))
+
+    return sumfac_qf_consume_kernel
 
 
 def get_sumfac_scatter_kernel(

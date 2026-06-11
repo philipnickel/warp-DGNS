@@ -31,7 +31,11 @@
   geometry hoisting, launch-plan caching). The fused linear cell apply additionally supports element batching via
   `fem.integrate(..., assembly="sumfac", assembly_options={"element_batch": E_b})` (2D only): the contraction stages
   run as wide GEMM panels over `E_b` elements per block, reducing the per-shape padding of the underlying tile GEMMs;
-  unsupported combinations (3D, bilinear, side forms, non-divisible element counts) raise a descriptive error.
+  unsupported combinations (3D, bilinear, side forms, non-divisible element counts) raise a descriptive error. The
+  linear cell apply also supports `assembly_options={"qfunction": "extracted"}` (2D only): the D stage runs as a
+  separate one-thread-per-quadrature-point extraction kernel (geometry evaluated per point, so curved and non-affine
+  elements are fully supported) followed by an integrand-independent `Bᵀ` tile contraction, removing the
+  block-redundant in-kernel integrand evaluation of the default `"seeded"` strategy; composable with `element_batch`.
 
 ### Removed
 
