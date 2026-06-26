@@ -1,0 +1,2 @@
+- experiment=fenton
+- experiment.params.t_final=0.1

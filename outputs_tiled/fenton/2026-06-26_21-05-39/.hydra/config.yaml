@@ -1,0 +1,215 @@
+solver:
+  _target_: dgns.ale.dual_splitting.factory.build_ale_dual_splitting_solver
+  _partial_: true
+  degree: ${experiment.degree}
+  pressure_degree: ${dgns.pressure_degree:${experiment.degree},${oc.select:experiment.equal_order,true}}
+  reynolds_number: ${experiment.reynolds_number}
+  dt: ${oc.select:experiment.dt,1.0e-3}
+  bdf_order: ${experiment.bdf_order}
+  fs_group: ${oc.select:experiment.fs.group,null}
+  sipg_penalty_scale: ${oc.select:experiment.fs.sipg_scale,1.0}
+  linear_solver:
+    pressure:
+      tol: 1.0e-06
+      atol: 1.0e-08
+      maxiter: 100
+      amg_max_levels: null
+      chebyshev_degree: 5
+    scalar_mass:
+      tol: 1.0e-09
+      maxiter: 500
+    velocity_mass:
+      exact_integration: true
+      cg_tol: 1.0e-12
+      cg_maxiter: 0
+    viscous:
+      tol: 1.0e-06
+      atol: 1.0e-08
+      maxiter: 500
+    penalty:
+      tol: 1.0e-06
+      atol: 1.0e-08
+      maxiter: 500
+    mesh_motion:
+      tol: 1.0e-06
+      atol: 1.0e-08
+      maxiter: 500
+      chebyshev_degree: 5
+      stiffening_exponent: 0.0
+  mass_conservation:
+    _target_: dgns.linear_solvers.penalty.FehnPenaltyPostprocess
+    _partial_: true
+    zeta_d: 1.0
+    zeta_c: 1.0
+    tol: ${solver.linear_solver.penalty.tol}
+    maxiter: ${solver.linear_solver.penalty.maxiter}
+  mesh_velocity_computer:
+    _target_: dgns.ale.dual_splitting.mesh_velocity.ConfigurableFreeSurfaceMeshVelocityComputer
+    policy: ${solver.free_surface_kinematic_policy}
+  free_surface_kinematic_policy:
+    _target_: dgns.mesh.movement.free_surface_kinematics.FreeSurfaceKinematicPolicy
+    c0_project_eta: ${oc.select:experiment.fs.c0_project_eta,true}
+    c0_project_velocity: ${oc.select:experiment.fs.c0_project_velocity,false}
+    kinematic_form: ${oc.select:experiment.fs.kinematic_form,geometric_normal_flux}
+    surface_flux: ${oc.select:experiment.fs.surface_flux,llf}
+    boundary_metric_quadrature: ${oc.select:experiment.fs.boundary_metric_quadrature,over_integrated}
+    boundary_metric_quadrature_order: ${oc.select:experiment.fs.boundary_metric_quadrature_order,null}
+postprocess:
+  enabled: true
+  snapshots:
+    mode: final
+    interval: 1
+    format: vtk
+    pvd: true
+  plots:
+    enabled: true
+    fields:
+    - velocity_magnitude
+    - velocity_magnitude_elements
+    - pressure
+    - pressure_elements
+    - free_surface_eta
+  diagnostics:
+    enabled: true
+  field_errors:
+    enabled: false
+    fields: {}
+    filename_prefix: field_errors
+    top_k: 8
+    plot: true
+experiment:
+  degree: 4
+  equal_order: true
+  bdf_order: 3
+  dt: 0.0001
+  cfl: 0.9
+  capture_diag_stride: 1
+  profile: false
+  params:
+    perturb: 0.0
+    steady_tol: null
+    early_stop:
+      mesh_tangle: true
+      dt_collapse: true
+      dt_collapse_min: 1.0e-07
+      max_iter: true
+    t_final: 0.1
+    max_steps: 20000
+    save_diagnostics_timeseries: false
+    save_eta_profile: true
+  problem:
+    _target_: dgns.app.problem_spec.ProblemSpec
+    name: fenton
+    mesh: ${experiment.mesh}
+    boundary_conditions:
+    - _target_: dgns.app.problem_spec.BoundarySpec
+      group: left
+      equation: ${oc.select:experiment.bc.left.equation,null}
+      kind: ${experiment.bc.left.kind}
+      value: null
+      pressure_value: null
+    - _target_: dgns.app.problem_spec.BoundarySpec
+      group: right
+      equation: ${oc.select:experiment.bc.right.equation,null}
+      kind: ${experiment.bc.right.kind}
+      value: null
+      pressure_value: null
+    - _target_: dgns.app.problem_spec.BoundarySpec
+      group: bottom
+      equation: ${oc.select:experiment.bc.bottom.equation,null}
+      kind: ${experiment.bc.bottom.kind}
+      value: null
+      pressure_value: null
+    - _target_: dgns.app.problem_spec.BoundarySpec
+      group: top
+      equation: ${oc.select:experiment.bc.top.equation,null}
+      kind: ${experiment.bc.top.kind}
+      value: null
+      pressure_value: null
+    solver_setups:
+    - _target_: dgns.app.problem_spec.SolverSetupSpec
+      name: install_ic
+      function:
+        _target_: dgns.app.problem_spec.ProblemFn
+        name: install_ic
+        fn:
+          path: problems.fenton.install_ic
+          _target_: hydra_zen.funcs.get_obj
+    diagnostics:
+    - _target_: dgns.app.problem_spec.DiagnosticSpec
+      name: surface_diagnostics
+      function:
+        _target_: dgns.app.problem_spec.ProblemFn
+        name: surface_diagnostics
+        fn:
+          path: problems.fenton.fenton_surface_diagnostics
+          _target_: hydra_zen.funcs.get_obj
+    step_hooks:
+    - _target_: dgns.app.problem_spec.StepHookSpec
+      name: step_diagnostics
+      function:
+        _target_: dgns.app.problem_spec.ProblemFn
+        name: step_diagnostics
+        fn:
+          path: problems.fenton.fenton_step_diagnostics
+          _target_: hydra_zen.funcs.get_obj
+      when: after_step
+    postprocessors:
+    - _target_: dgns.app.problem_spec.PostprocessSpec
+      name: fenton_artifacts
+      function:
+        _target_: dgns.app.problem_spec.ProblemFn
+        name: fenton_artifacts
+        fn:
+          path: problems.fenton.fenton_artifacts
+          _target_: hydra_zen.funcs.get_obj
+    - _target_: dgns.app.problem_spec.PostprocessSpec
+      name: export_solution_vtk
+      function:
+        _target_: dgns.app.problem_spec.ProblemFn
+        name: export_solution_vtk
+        fn:
+          path: dgns.postprocessing.problem_metrics.export_solution_vtk
+          _target_: hydra_zen.funcs.get_obj
+  name: fenton
+  case: fenton
+  wave:
+    kh: 1.0
+    steepness_percent: 90.0
+    n_wavelengths: 1
+    depth: 1.0
+    order: 9
+  mesh:
+    _target_: problems.meshgen.fenton.fenton_mesh
+    kh: ${experiment.wave.kh}
+    n_wavelengths: ${experiment.wave.n_wavelengths}
+    depth: ${experiment.wave.depth}
+    nx: 20
+    ny: 2
+    degree: ${experiment.degree}
+  bc:
+    left:
+      kind: periodic
+    right:
+      kind: periodic
+    bottom:
+      equation: velocity
+      kind: slip
+    top:
+      equation: velocity
+      kind: neumann
+  fs:
+    group: top
+    pressure_coeff: 1.0
+    sipg_scale: 1.0
+    c0_project_eta: true
+    c0_project_velocity: false
+    kinematic_form: geometric_normal_flux
+    surface_flux: llf
+    boundary_metric_quadrature: over_integrated
+    boundary_metric_quadrature_order: null
+  reynolds_number: .inf
+mesh_only: false
+validation:
+  enabled: false
+  metrics: {}
