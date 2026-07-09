@@ -62,8 +62,14 @@ def sip_diffusion_form(
 
 
 class Example:
-    def __init__(self, quiet=False, degree=2, resolution=50, mesh="grid", viscosity=0.0001, ang_vel=1.0):
+    def __init__(self, quiet=False, degree=2, resolution=50, mesh="grid", viscosity=0.0001, ang_vel=1.0, sumfac=False):
         self._quiet = quiet
+
+        if sumfac and mesh == "tri":
+            raise ValueError("assembly='sumfac' requires a tensor-product mesh; use --mesh grid or --mesh quad")
+        # Volume terms may use the sum-factorized path; side (DG flux) terms
+        # always use the default assembly until surface sum-factorization lands.
+        self._volume_assembly = "sumfac" if sumfac else None
 
         res = resolution
         self.sim_dt = 1.0 / (ang_vel * res)
@@ -96,12 +102,14 @@ class Example:
             inertia_form,
             fields={"phi": trial, "psi": self._test},
             values={"dt": self.sim_dt},
+            assembly=self._volume_assembly,
         )
 
         matrix_transport = fem.integrate(
             transport_form,
             fields={"phi": trial, "psi": self._test},
             values={"ang_vel": ang_vel},
+            assembly=self._volume_assembly,
         )
 
         self._side_test = fem.make_test(space=scalar_space, domain=sides)
@@ -117,6 +125,7 @@ class Example:
         matrix_diffusion = fem.integrate(
             diffusion_form,
             fields={"u": trial, "v": self._test},
+            assembly=self._volume_assembly,
         )
         matrix_diffusion += fem.integrate(
             sip_diffusion_form,
@@ -142,6 +151,7 @@ class Example:
             inertia_form,
             fields={"phi": self._phi_field, "psi": self._test},
             values={"dt": self.sim_dt},
+            assembly=self._volume_assembly,
         )
 
         phi = wp.zeros_like(rhs)
@@ -158,6 +168,7 @@ class Example:
             diffusion_form,
             fields={"u": self._phi_field, "v": self._test},
             output=self._phi_curvature_field.dof_values,
+            assembly=self._volume_assembly,
         )
         fem.integrate(
             sip_diffusion_form,
@@ -188,6 +199,11 @@ if __name__ == "__main__":
     parser.add_argument("--ang-vel", type=float, default=1.0, help="Angular velocity.")
     parser.add_argument("--mesh", choices=("grid", "tri", "quad"), default="grid", help="Mesh type.")
     parser.add_argument(
+        "--sumfac",
+        action="store_true",
+        help="Use sum-factorized assembly (assembly='sumfac') for the volume terms. Requires grid or quad mesh.",
+    )
+    parser.add_argument(
         "--headless",
         action="store_true",
         help="Run in headless mode, suppressing the opening of any graphical windows.",
@@ -204,6 +220,7 @@ if __name__ == "__main__":
             mesh=args.mesh,
             viscosity=args.viscosity,
             ang_vel=args.ang_vel,
+            sumfac=args.sumfac,
         )
 
         for _k, _ in fem_example_utils.progress_bar(args.num_frames, quiet=args.quiet):

@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2023 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-import math
 from enum import Enum
 
 import numpy as np
@@ -34,58 +33,65 @@ def is_closed(family: Polynomial):
 
 
 def _gauss_legendre_quadrature_1d(n: int):
-    if n == 1:
-        coords = [0.0]
-        weights = [2.0]
-    elif n == 2:
-        coords = [-math.sqrt(1.0 / 3), math.sqrt(1.0 / 3)]
-        weights = [1.0, 1.0]
-    elif n == 3:
-        coords = [0.0, -math.sqrt(3.0 / 5.0), math.sqrt(3.0 / 5.0)]
-        weights = [8.0 / 9.0, 5.0 / 9.0, 5.0 / 9.0]
-    elif n == 4:
-        c_a = math.sqrt(3.0 / 7.0 - 2.0 / 7.0 * math.sqrt(6.0 / 5.0))
-        c_b = math.sqrt(3.0 / 7.0 + 2.0 / 7.0 * math.sqrt(6.0 / 5.0))
-        w_a = (18.0 + math.sqrt(30.0)) / 36.0
-        w_b = (18.0 - math.sqrt(30.0)) / 36.0
-        coords = [c_a, -c_a, c_b, -c_b]
-        weights = [w_a, w_a, w_b, w_b]
-    elif n == 5:
-        c_a = 1.0 / 3.0 * math.sqrt(5.0 - 2.0 * math.sqrt(10.0 / 7.0))
-        c_b = 1.0 / 3.0 * math.sqrt(5.0 + 2.0 * math.sqrt(10.0 / 7.0))
-        w_a = (322.0 + 13.0 * math.sqrt(70.0)) / 900.0
-        w_b = (322.0 - 13.0 * math.sqrt(70.0)) / 900.0
-        coords = [0.0, c_a, -c_a, c_b, -c_b]
-        weights = [128.0 / 225.0, w_a, w_a, w_b, w_b]
-    else:
-        raise NotImplementedError
+    """Gauss--Legendre quadrature with ``n`` points, shifted to the ``[0, 1]`` interval.
 
-    # Shift from [-1, 1] to [0, 1]
-    weights = 0.5 * np.array(weights)
-    coords = 0.5 * np.array(coords) + 0.5
+    The rule is exact for polynomials up to degree ``2n - 1``. Points are returned in
+    ascending order and the weights sum to ``1`` (the measure of ``[0, 1]``).
+    """
+    if n < 1:
+        raise ValueError(f"Gauss--Legendre quadrature requires at least one point (got n={n}).")
+
+    # Roots of the degree-n Legendre polynomial on [-1, 1] with their weights.
+    coords, weights = np.polynomial.legendre.leggauss(n)
+
+    # Shift from [-1, 1] to [0, 1]; the weights pick up a factor of 1/2 from the change
+    # of measure. ``leggauss`` already returns the roots in ascending order.
+    weights = 0.5 * weights
+    coords = 0.5 * coords + 0.5
 
     return coords, weights
 
 
 def _lobatto_gauss_legendre_quadrature_1d(n: int):
-    if n == 2:
-        coords = [-1.0, 1.0]
-        weights = [1.0, 1.0]
-    elif n == 3:
-        coords = [-1.0, 0.0, 1.0]
-        weights = [1.0 / 3.0, 4.0 / 3.0, 1.0 / 3.0]
-    elif n == 4:
-        coords = [-1.0, -1.0 / math.sqrt(5.0), 1.0 / math.sqrt(5.0), 1.0]
-        weights = [1.0 / 6.0, 5.0 / 6.0, 5.0 / 6.0, 1.0 / 6.0]
-    elif n == 5:
-        coords = [-1.0, -math.sqrt(3.0 / 7.0), 0.0, math.sqrt(3.0 / 7.0), 1.0]
-        weights = [1.0 / 10.0, 49.0 / 90.0, 32.0 / 45.0, 49.0 / 90.0, 1.0 / 10.0]
-    else:
-        raise NotImplementedError
+    """Lobatto--Gauss--Legendre quadrature with ``n`` points, shifted to ``[0, 1]``.
 
-    # Shift from [-1, 1] to [0, 1]
-    weights = 0.5 * np.array(weights)
-    coords = 0.5 * np.array(coords) + 0.5
+    The rule includes the interval endpoints and is exact for polynomials up to degree
+    ``2n - 3``. Points are returned in ascending order and the weights sum to ``1`` (the
+    measure of ``[0, 1]``).
+    """
+    if n < 2:
+        raise ValueError(f"Lobatto--Gauss--Legendre quadrature requires at least two points (got n={n}).")
+
+    # Interior nodes are the roots of P'_{n-1}; together with the endpoints they are the
+    # roots of (1 - x^2) P'_{n-1}(x). Solve for all nodes on [-1, 1] by Newton iteration,
+    # initialized at the Chebyshev--Gauss--Lobatto points, then apply the Christoffel
+    # weights w_i = 2 / (n (n-1) [P_{n-1}(x_i)]^2).
+    coords = np.cos(np.pi * np.arange(n) / (n - 1))  # descending Chebyshev guess
+    coords = np.sort(coords)  # ascending
+
+    legendre = np.zeros((n, n))
+    previous = 2.0 * np.ones(n)
+    # Newton's method on the Legendre--Lobatto residual x P_{n-1} - P_{n-2}.
+    while np.max(np.abs(coords - previous)) > 1e-15:
+        previous = coords.copy()
+
+        legendre[:, 0] = 1.0
+        legendre[:, 1] = coords
+        for k in range(2, n):
+            legendre[:, k] = ((2 * k - 1) * coords * legendre[:, k - 1] - (k - 1) * legendre[:, k - 2]) / k
+
+        coords = previous - (coords * legendre[:, n - 1] - legendre[:, n - 2]) / (n * legendre[:, n - 1])
+
+    # Pin the endpoints exactly.
+    coords[0] = -1.0
+    coords[-1] = 1.0
+
+    p_nm1 = legendre[:, n - 1]
+    weights = 2.0 / ((n - 1) * n * p_nm1 * p_nm1)
+
+    # Shift from [-1, 1] to [0, 1]; the weights pick up a factor of 1/2.
+    weights = 0.5 * weights
+    coords = 0.5 * coords + 0.5
 
     return coords, weights
 

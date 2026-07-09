@@ -15,6 +15,27 @@
 - Extend `wp.utils.array_scan()` to 64-bit scalar and vector types, and extend `wp.utils.radix_sort_pairs()` to 32- and
   64-bit signed, unsigned, and floating-point keys with 4- or 8-byte values
   ([GH-1538](https://github.com/NVIDIA/warp/issues/1538)).
+- Add row-capacity support to `warp.sparse` BSR matrices, including padded topology policies for topology-changing
+  sparse operations, `bsr_zeros(row_capacity=...)` for reserving row capacity, `bsr_compress()` for inplace compaction of sparse matrices, and sparse status constants for overflow checks ([GH-1537](https://github.com/NVIDIA/warp/issues/1537)).
+- `fem.integrate()` and `fem.interpolate()` can now leverage `sparse.bsr_compress()` to perform inplace matrix assembly, reducing peak memory usage ([GH-1537](https://github.com/NVIDIA/warp/issues/1537)).
+- `warp.fem`: Add an opt-in sum-factorized path for high-order tensor-product discontinuous-Galerkin forms:
+  `fem.integrate(..., assembly="sumfac")` selects fused `BᵀDB` kernels for both the matrix-free apply of linear forms
+  and the assembly of bilinear forms to a sparse matrix. Requires a cell domain over a tensor-product geometry, a
+  scalar discontinuous tensor-product polynomial space, and a matching `RegularQuadrature`; forms that do not qualify
+  raise an error describing the unmet requirement. The convection-diffusion DG example demonstrates the hybrid pattern
+  (sum-factorized volume terms, default-path DG flux terms) via a new `--sumfac` flag. Linear side (DG face) forms over
+  `fem.Sides`/`fem.BoundarySides` (or side subdomains) of `Grid2D`/`Grid3D` geometries are also supported with
+  sum-factorized face traces, enabling fully matrix-free DG operators (e.g. SIPG diffusion: sum-factorized volume apply
+  plus sum-factorized interior-penalty flux apply); bilinear side forms keep using the default assembly. The
+  sum-factorized side apply is around 5x faster than its first release (stacked face-trace operators, per-face
+  geometry hoisting, launch-plan caching). The fused linear cell apply additionally supports element batching via
+  `fem.integrate(..., assembly="sumfac", assembly_options={"element_batch": E_b})` (2D only): the contraction stages
+  run as wide GEMM panels over `E_b` elements per block, reducing the per-shape padding of the underlying tile GEMMs;
+  unsupported combinations (3D, bilinear, side forms, non-divisible element counts) raise a descriptive error. The
+  linear cell apply also supports `assembly_options={"qfunction": "extracted"}` (2D only): the D stage runs as a
+  separate one-thread-per-quadrature-point extraction kernel (geometry evaluated per point, so curved and non-affine
+  elements are fully supported) followed by an integrand-independent `Bᵀ` tile contraction, removing the
+  block-redundant in-kernel integrand evaluation of the default `"seeded"` strategy; composable with `element_batch`.
 
 ### Removed
 
@@ -25,6 +46,8 @@
 
 ### Deprecated
 
+- Deprecate `masked=True` arguments in `warp.sparse` topology-changing operations; use `topology="masked"` instead.
+
 ### Changed
 
 - **Breaking:** Raise an error during `wp.init()` when the Warp Python package version does not match the loaded native
@@ -32,6 +55,9 @@
   or unreadable native version symbols the same way ([GH-1508](https://github.com/NVIDIA/warp/issues/1508)).
 - Speed up Warp kernel creation, particularly for workloads that declare many kernels programmatically (e.g. dynamic
   factory patterns) ([GH-1486](https://github.com/NVIDIA/warp/issues/1486)).
+- Improve `wp.mesh_query_ray()` and `wp.mesh_query_ray_anyhit()` BVH traversal performance
+  by visiting the nearer child first at each inner node, enabling earlier tightening of the
+  closest-hit bound and more aggressive subtree pruning. ([GH-1529](https://github.com/NVIDIA/warp/issues/1529))
 
 ### Fixed
 
@@ -68,6 +94,18 @@
 - Fix unary minus on referenced 64-bit scalar constants, such as values declared with `wp.constant(wp.float64(...))`,
   being silently dropped when the constant appears as the leading operand of a multiply or divide expression, e.g.
   `-a * b` producing the wrong sign ([GH-1540](https://github.com/NVIDIA/warp/issues/1540)).
+- Fix `wp.mesh_query_ray()` and related functions silently missing intersections for
+  axis-aligned rays whose origin lies on a BVH node's AABB slab boundary. The previous
+  traversal relied on fixed `eps = 1e-3` AABB inflation to avoid `0 * inf` cases in the
+  slab calculation, but that offset is not robust at larger coordinate scales where it
+  can round away in float32. Parallel slabs are now handled explicitly, and the
+  per-traversal epsilon expansion is removed
+  ([GH-1530](https://github.com/NVIDIA/warp/issues/1530)).
+- Fix parameterized `@wp.func(...)` decorators, such as `@wp.func(module="unique")`, in directly executed scripts to
+  register successfully instead of raising `AttributeError` during decoration
+  ([GH-1544](https://github.com/NVIDIA/warp/issues/1544)).
+- Fix LTO cache collisions and stale FFT metadata handling by using longer cache keys and rebuilding invalid metadata
+  ([GH-1511](https://github.com/NVIDIA/warp/issues/1511)).
 
 ### Documentation
 

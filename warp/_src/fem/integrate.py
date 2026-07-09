@@ -43,19 +43,151 @@ from warp._src.fem.types import (
     OUTSIDE,
     DofIndex,
     Domain,
+    ElementKind,
     Field,
     Sample,
     make_free_sample,
 )
 from warp._src.fem.utils import type_zero_element
 from warp._src.logger import log_warning
-from warp._src.sparse import BsrMatrix, bsr_set_from_triplets, bsr_zeros
 from warp._src.types import is_array, type_length, type_repr, type_scalar_type, type_size, type_to_warp
-from warp._src.utils import array_cast
+from warp._src.utils import array_cast, array_scan
+from warp.sparse import BsrMatrix, bsr_axpy, bsr_compress, bsr_set_from_triplets, bsr_set_zero, bsr_zeros
 
 __all__ = ["integrate", "interpolate"]
 
 _wp_module_name_ = "warp.fem.integrate"
+
+_BSR_CAPACITY_AUTO = "auto"
+_BSR_CAPACITY_REUSE = "reuse"
+
+_BSR_CONSTRUCTION_AUTO = "auto"
+_BSR_CONSTRUCTION_TRIPLETS = "triplets"
+_BSR_CONSTRUCTION_ROW_COMPRESS = "row_compress"
+
+
+def _bsr_values_as_3d_array(values: wp.array, block_shape: tuple[int, int]) -> wp.array:
+    return wp.array(
+        ptr=values.ptr,
+        capacity=values.capacity,
+        device=values.device,
+        dtype=type_scalar_type(values.dtype),
+        shape=(values.shape[0], *block_shape),
+        grad=None if values.grad is None else _bsr_values_as_3d_array(values.grad, block_shape),
+    )
+
+
+def _normalize_fem_bsr_options(bsr_options: dict[str, Any] | None) -> tuple[dict[str, Any], str, str]:
+    sparse_options = dict(bsr_options or {})
+
+    capacity = sparse_options.pop("capacity", _BSR_CAPACITY_AUTO)
+    if capacity not in (_BSR_CAPACITY_AUTO, _BSR_CAPACITY_REUSE):
+        raise ValueError(
+            f"Unsupported BSR capacity policy: {capacity}. Expected '{_BSR_CAPACITY_AUTO}' or '{_BSR_CAPACITY_REUSE}'"
+        )
+
+    construction = sparse_options.pop("construction", _BSR_CONSTRUCTION_TRIPLETS)
+    if construction not in (_BSR_CONSTRUCTION_AUTO, _BSR_CONSTRUCTION_TRIPLETS, _BSR_CONSTRUCTION_ROW_COMPRESS):
+        raise ValueError(
+            f"Unsupported BSR construction policy: {construction}. Expected '{_BSR_CONSTRUCTION_AUTO}', "
+            f"'{_BSR_CONSTRUCTION_TRIPLETS}', or '{_BSR_CONSTRUCTION_ROW_COMPRESS}'"
+        )
+
+    if "inplace" in sparse_options:
+        raise ValueError(
+            "fem.integrate() and fem.interpolate() choose bsr_compress(inplace=...) from output values "
+            "gradient requirements; use bsr_options['construction'] to select row compression"
+        )
+
+    return sparse_options, capacity, construction
+
+
+def _require_bsr_capacity(bsr: BsrMatrix, nnz: int, operation: str):
+    if bsr.columns.size < nnz or bsr.values.size < nnz:
+        raise RuntimeError(
+            f"{operation} with bsr_options['capacity']='reuse' requires existing BSR storage for at least "
+            f"{nnz} blocks, got columns={bsr.columns.size} and values={bsr.values.size}"
+        )
+
+
+def _field_requiring_grad(field_args: dict[str, Any]) -> str | None:
+    """Return the name of the first field argument carrying differentiable degrees of freedom, if any.
+
+    Conservative: a field whose degrees of freedom cannot be introspected is
+    treated as differentiable.
+    """
+    for name, field in field_args.items():
+        try:
+            dof_values = getattr(field, "dof_values", None)
+        except NotImplementedError:
+            # Trace fields do not expose dof_values directly; introspect the
+            # underlying cell field instead.
+            cell_field = getattr(field, "cell_field", None)
+            if cell_field is None or cell_field is field:
+                return name
+            try:
+                dof_values = getattr(cell_field, "dof_values", None)
+            except NotImplementedError:
+                return name
+        if is_array(dof_values) and dof_values.requires_grad:
+            return name
+    return None
+
+
+def _validate_sumfac_request(domain, test, trial, quadrature, output, kernel_options, accumulate_dtype, field_args):
+    """Check the :func:`integrate`-level preconditions of ``assembly="sumfac"``.
+
+    Raises :class:`warp._src.fem.sumfac.SumfacNotApplicableError` naming the
+    first unmet requirement. The remaining structural requirements (geometry,
+    space, quadrature point layout, operators) are checked by the
+    sum-factorization layout finders.
+    """
+    from warp._src.fem.sumfac.kernels import SumfacNotApplicableError  # noqa: PLC0415 (circular import)
+
+    # Checked here (rather than only in the layout finders) so that side
+    # bilinear forms get the meaningful error before any field introspection.
+    if domain.element_kind != ElementKind.CELL and trial is not None:
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' does not support bilinear forms over side (DG face) domains; only linear side "
+            "forms (matrix-free face applies) are sum-factorized -- assemble side matrices with the default "
+            "assembly"
+        )
+    if test is None:
+        raise SumfacNotApplicableError("assembly='sumfac' requires a linear or bilinear form with a test field")
+    if type(test) is not TestField:
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' requires a plain test field created by fem.make_test(); got {type(test).__name__}"
+        )
+    if trial is not None and type(trial) is not TrialField:
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' requires a plain trial field created by fem.make_trial(); got {type(trial).__name__}"
+        )
+    if not isinstance(quadrature, RegularQuadrature):
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' requires a RegularQuadrature over the integration domain; "
+            f"got {type(quadrature).__name__}"
+        )
+    if type_to_warp(accumulate_dtype) not in (wp.float32, wp.float64):
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' only supports float32 or float64 accumulation; "
+            f"got accumulate_dtype={type_repr(accumulate_dtype)}"
+        )
+    if (kernel_options or {}).get("enable_backward", False):
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' does not support backward-mode differentiation "
+            "(kernel_options['enable_backward'] is True); use the default assembly instead"
+        )
+    if output is not None and getattr(output, "requires_grad", False):
+        raise SumfacNotApplicableError(
+            "assembly='sumfac' does not support differentiable outputs (output.requires_grad is True); "
+            "use the default assembly instead"
+        )
+    grad_field = _field_requiring_grad(field_args)
+    if grad_field is not None:
+        raise SumfacNotApplicableError(
+            f"assembly='sumfac' does not support differentiable field inputs; field '{grad_field}' has "
+            "dof_values.requires_grad=True (or its degrees of freedom cannot be introspected)"
+        )
 
 
 def _resolve_path(func, node):
@@ -508,6 +640,7 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
         domain_index_var_name: str = "domain_index_arg",
         sample_var_name: str = "sample",
         field_wrappers_attr: str = "_field_wrappers",
+        domain_geo_var_name: str | None = None,
     ):
         self._arg_names = arg_names
         self._field_args = parsed_args.field_args
@@ -522,6 +655,13 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
         self._domain_var_name = domain_var_name
         self._domain_index_var_name = domain_index_var_name
         self._sample_var_name = sample_var_name
+        # When set, the integrand's Domain argument is built from this local
+        # variable instead of the kernel's domain element arg; the fused
+        # sum-factorized side kernel uses it to substitute a per-face
+        # geometry-injected element arg (see
+        # warp._src.fem.sumfac.side_kernels.SideConstantGeometryDomain) while
+        # field arguments keep receiving the native element arg.
+        self._domain_geo_var_name = domain_geo_var_name
 
         self._field_wrappers_attr = field_wrappers_attr
         self._register_integrand_field_wrappers(integrand_func, parsed_args.field_args)
@@ -540,7 +680,7 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
                 setattr(field_wrappers, name, field.DomainArg)
         setattr(integrand_func, self._field_wrappers_attr, field_wrappers)
 
-    def _emit_field_wrapper_call(self, field_name, *data_arguments):
+    def _emit_field_wrapper_call(self, field_name, *data_arguments, elt_var_name: str | None = None):
         return ast.Call(
             func=ast.Attribute(
                 value=ast.Attribute(
@@ -552,7 +692,7 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
                 ctx=ast.Load(),
             ),
             args=[
-                ast.Name(id=self._domain_var_name, ctx=ast.Load()),
+                ast.Name(id=elt_var_name or self._domain_var_name, ctx=ast.Load()),
                 *data_arguments,
             ],
             keywords=[],
@@ -572,6 +712,7 @@ class PassFieldArgsToIntegrand(ast.NodeTransformer):
                         self._emit_field_wrapper_call(
                             arg,
                             ast.Name(id=self._domain_index_var_name, ctx=ast.Load()),
+                            elt_var_name=self._domain_geo_var_name,
                         )
                     )
 
@@ -962,7 +1103,8 @@ def get_integrate_bilinear_kernel(
                     )
                 else:
                     trial_node_index = NULL_NODE_INDEX  # will get ignored when converting to bsr
-                triplet_rows[block_offset] = test_node_index
+                if triplet_rows:
+                    triplet_rows[block_offset] = test_node_index
                 triplet_cols[block_offset] = trial_node_index
 
     return integrate_kernel_fn
@@ -993,7 +1135,8 @@ def get_integrate_bilinear_nodal_kernel(
 
         partition_node_index = test.space_restriction.node_partition_index(test_restriction_arg, local_node_index)
         if partition_node_index == NULL_NODE_INDEX:
-            triplet_rows[local_node_index] = -1
+            if triplet_rows:
+                triplet_rows[local_node_index] = -1
             triplet_cols[local_node_index] = -1
             return
 
@@ -1047,7 +1190,8 @@ def get_integrate_bilinear_nodal_kernel(
                 val_sum += accumulate_dtype(node_weight * vol) * accumulate_dtype(val)
 
         triplet_values[local_node_index, test_dof, trial_dof] = output_dtype(val_sum)
-        triplet_rows[local_node_index] = partition_node_index
+        if triplet_rows:
+            triplet_rows[local_node_index] = partition_node_index
         triplet_cols[local_node_index] = partition_node_index
 
     return integrate_kernel_fn
@@ -1117,10 +1261,235 @@ def _generate_integrate_kernel(
     output_dtype: type,
     accumulate_dtype: type,
     kernel_options: dict[str, Any] | None = None,
+    sumfac_plan=None,
 ) -> wp.Kernel:
     output_dtype = type_scalar_type(output_dtype)
 
     _notify_operator_usage(integrand, arguments.field_args)
+
+    if sumfac_plan is not None:
+        # Sum-factorized fused B^T D B kernel. Must be handled before the generic
+        # branches: the seed/injected field substitution (performed by
+        # make_sumfac_plan / make_sumfac_bilinear_plan) changes the field structs
+        # and the transformed integrand, so the kernel suffix is recomputed from
+        # the substituted field names and tagged with a sum-factorization
+        # discriminator plus the baked tile sizes -- a cache-key collision with
+        # the legacy kernel would be a silent-correctness bug.
+        from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+        from warp._src.fem.sumfac import side_kernels as sumfac_side_kernels  # noqa: PLC0415 (circular import)
+
+        is_bilinear = isinstance(sumfac_plan, sumfac_kernels.SumfacBilinearPlan)
+        is_side = isinstance(sumfac_plan, sumfac_side_kernels.SumfacSidePlan)
+
+        field_names = tuple((k, f.name) for k, f in arguments.field_args.items())
+        if is_side:
+            kernel_suffix = (
+                "sumfac-side",
+                sumfac_plan.n,
+                sumfac_plan.q,
+                sumfac_plan.dim,
+                sumfac_plan.test_uses_grad,
+                # The kernel bakes the ORIGINAL cell field's EvalArg for the
+                # trace gather; discriminate on the concrete class so a future
+                # NodalField subclass cannot silently reuse the base kernel.
+                type(sumfac_plan.cell_field).__qualname__,
+                domain.name,
+                quadrature.name,
+                field_names,
+                cache.pod_type_key(output_dtype),
+                cache.pod_type_key(accumulate_dtype),
+            )
+        elif is_bilinear:
+            kernel_suffix = (
+                "sumfac-bilinear",
+                sumfac_plan.element_batch,
+                sumfac_plan.n,
+                sumfac_plan.q,
+                sumfac_plan.dim,
+                sumfac_plan.test_uses_grad,
+                sumfac_plan.trial_uses_grad,
+                quadrature.name,
+                field_names,
+                cache.pod_type_key(output_dtype),
+                cache.pod_type_key(accumulate_dtype),
+            )
+        else:
+            kernel_suffix = (
+                "sumfac",
+                sumfac_plan.qfunction,
+                sumfac_plan.element_batch,
+                sumfac_plan.n,
+                sumfac_plan.q,
+                sumfac_plan.dim,
+                sumfac_plan.test_uses_grad,
+                # The kernel bakes the ORIGINAL input field's _read_node_value and
+                # EvalArg, but the substituted field names only carry the
+                # ValueInjectedField name: discriminate on the concrete class so a
+                # future NodalField subclass over the same space cannot silently
+                # reuse the base-class kernel.
+                type(sumfac_plan.input_field).__qualname__,
+                quadrature.name,
+                field_names,
+                cache.pod_type_key(output_dtype),
+                cache.pod_type_key(accumulate_dtype),
+            )
+        # The staged kernel does not support autodiff yet; with backward enabled
+        # every tile_matmul would build three GEMM LTOs, tripling compile time.
+        sumfac_kernel_options = dict(kernel_options) if kernel_options else {}
+        sumfac_kernel_options["enable_backward"] = False
+
+        kernel, field_arg_values, value_struct_values = cache.get_integrand_kernel(
+            integrand=integrand,
+            suffix=kernel_suffix,
+            kernel_options=sumfac_kernel_options,
+        )
+        if kernel is None:
+            FieldStruct = _gen_field_struct(arguments.field_args)
+            ValueStruct = cache.get_argument_struct(arguments.value_args)
+
+            _check_field_compat(integrand, arguments, domain)
+
+            integrand_func = IntegrandTransformer.apply(
+                integrand, arguments.field_args, sample_type=domain.geometry.sample_type
+            )
+
+            if is_side:
+                integrate_kernel_fn = sumfac_side_kernels.get_integrate_side_sumfac_kernel(
+                    integrand_func,
+                    domain,
+                    quadrature,
+                    FieldStruct,
+                    ValueStruct,
+                    test=test,
+                    cell_field=sumfac_plan.cell_field,
+                    injected_field=sumfac_plan.injected_field,
+                    n=sumfac_plan.n,
+                    q=sumfac_plan.q,
+                    dim=sumfac_plan.dim,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                    accumulate_dtype=accumulate_dtype,
+                    injected_domain=sumfac_plan.injected_domain,
+                )
+
+                copied_field_names = [
+                    name
+                    for name, field in arguments.field_args.items()
+                    if isinstance(field, FieldLike) and name != sumfac_plan.input_name
+                ]
+                code_transformers = [
+                    sumfac_kernels.SumfacQPFieldsTransformer(
+                        copied_field_names=copied_field_names,
+                        injected_field_name=sumfac_plan.input_name,
+                    ),
+                    PassFieldArgsToIntegrand(
+                        arg_names=integrand.argspec.args,
+                        parsed_args=arguments,
+                        integrand_func=integrand_func,
+                        fields_var_name="qp_fields",
+                        # The integrand's Domain argument reads the per-face
+                        # injected element arg (side-constant geometry); field
+                        # arguments keep the native domain_arg.
+                        domain_geo_var_name="qp_domain_geo",
+                    ),
+                ]
+            elif is_bilinear:
+                integrate_kernel_fn = sumfac_kernels.get_integrate_bilinear_sumfac_kernel(
+                    integrand_func,
+                    domain,
+                    quadrature,
+                    FieldStruct,
+                    ValueStruct,
+                    test=test,
+                    trial=trial,
+                    n=sumfac_plan.n,
+                    q=sumfac_plan.q,
+                    dim=sumfac_plan.dim,
+                    element_batch=sumfac_plan.element_batch,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                    trial_uses_grad=sumfac_plan.trial_uses_grad,
+                    accumulate_dtype=accumulate_dtype,
+                    output_dtype=output_dtype,
+                )
+                # Both seed selectors travel through the Sample, so the kernel's
+                # `fields` argument is passed to the integrand unchanged.
+                code_transformers = [
+                    PassFieldArgsToIntegrand(
+                        arg_names=integrand.argspec.args,
+                        parsed_args=arguments,
+                        integrand_func=integrand_func,
+                    ),
+                ]
+            elif sumfac_plan.qfunction == "extracted":
+                from warp._src.fem.sumfac import qfunction as sumfac_qfunction  # noqa: PLC0415 (circular import)
+
+                # The generated kernel is the one-thread-per-quadrature-point
+                # extraction kernel; the integrand-independent B^T consume
+                # kernel is fetched separately at launch time.
+                integrate_kernel_fn = sumfac_qfunction.make_qfunction_ref_eval_kernel_fn(
+                    integrand_func,
+                    domain,
+                    quadrature,
+                    FieldStruct,
+                    ValueStruct,
+                    accumulate_dtype=accumulate_dtype,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                )
+                code_transformers = [
+                    PassFieldArgsToIntegrand(
+                        arg_names=integrand.argspec.args,
+                        parsed_args=arguments,
+                        integrand_func=integrand_func,
+                    ),
+                ]
+            else:
+                integrate_kernel_fn = sumfac_kernels.get_integrate_linear_sumfac_kernel(
+                    integrand_func,
+                    domain,
+                    quadrature,
+                    FieldStruct,
+                    ValueStruct,
+                    test=test,
+                    input_field=sumfac_plan.input_field,
+                    injected_field=sumfac_plan.injected_field,
+                    n=sumfac_plan.n,
+                    q=sumfac_plan.q,
+                    dim=sumfac_plan.dim,
+                    element_batch=sumfac_plan.element_batch,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                    accumulate_dtype=accumulate_dtype,
+                )
+
+                copied_field_names = [
+                    name
+                    for name, field in arguments.field_args.items()
+                    if isinstance(field, FieldLike) and name != sumfac_plan.input_name
+                ]
+                code_transformers = [
+                    sumfac_kernels.SumfacQPFieldsTransformer(
+                        copied_field_names=copied_field_names,
+                        injected_field_name=sumfac_plan.input_name,
+                    ),
+                    PassFieldArgsToIntegrand(
+                        arg_names=integrand.argspec.args,
+                        parsed_args=arguments,
+                        integrand_func=integrand_func,
+                        fields_var_name="qp_fields",
+                    ),
+                ]
+
+            kernel, _FieldStruct, _ValueStruct = cache.get_integrand_kernel(
+                integrand=integrand,
+                kernel_fn=integrate_kernel_fn,
+                suffix=kernel_suffix,
+                kernel_options=sumfac_kernel_options,
+                code_transformers=code_transformers,
+                FieldStruct=FieldStruct,
+                ValueStruct=ValueStruct,
+            )
+            field_arg_values, value_struct_values = FieldStruct(), ValueStruct()
+
+        kernel._wp_fem_sumfac_ = True
+        return kernel, field_arg_values, value_struct_values
 
     # Check if kernel exist in cache
     field_names = tuple((k, f.name) for k, f in arguments.field_args.items())
@@ -1288,6 +1657,67 @@ def _as_2d_array(array, shape, dtype):
     )
 
 
+@wp.kernel(enable_backward=False)
+def _fill_integrate_bsr_offsets_from_row_groups(
+    row_count: int,
+    row_offsets: wp.array(dtype=int),
+    row_capacity: int,
+    dest_offsets: wp.array(dtype=int),
+    dest_row_counts: wp.array(dtype=int),
+):
+    row = wp.tid()
+
+    offset = row_offsets[row] * row_capacity
+    dest_offsets[row] = offset
+    if row > 0:
+        dest_row_counts[row - 1] = offset - row_offsets[row - 1] * row_capacity
+
+
+@wp.kernel(enable_backward=False)
+def _fill_bsr_offsets_with_uniform_capacity(
+    row_count: int,
+    row_capacity: int,
+    dest_offsets: wp.array(dtype=int),
+    dest_row_counts: wp.array(dtype=int),
+):
+    row = wp.tid()
+
+    offset = row * row_capacity
+    dest_offsets[row] = offset
+    if row > 0:
+        dest_row_counts[row - 1] = row_capacity
+
+
+@wp.kernel(enable_backward=False)
+def _count_integrate_bsr_rows_from_sorted_rows(
+    row_count: int,
+    valid_row_count: int,
+    rows: wp.array(dtype=int),
+    row_counts: wp.array(dtype=int),
+):
+    row = wp.tid()
+
+    if row == row_count:
+        row_counts[row] = 0
+        return
+
+    row_limit = valid_row_count
+    if row_limit > rows.shape[0]:
+        row_limit = rows.shape[0]
+
+    if row_limit == 0:
+        row_counts[row] = 0
+        return
+
+    # wp.lower_bound() clamps to arr_end - 1; bump the result to row_limit when
+    # the value is larger than all in-range elements.
+    beg_idx = wp.lower_bound(rows, 0, row_limit, row)
+    row_beg = wp.where(rows[beg_idx] < row, row_limit, beg_idx)
+    end_idx = wp.lower_bound(rows, 0, row_limit, row + 1)
+    row_end = wp.where(rows[end_idx] < row + 1, row_limit, end_idx)
+    row_counts[row] = row_end - row_beg
+
+
 def _launch_integrate_kernel(
     integrand: Integrand,
     kernel: wp.Kernel,
@@ -1307,6 +1737,7 @@ def _launch_integrate_kernel(
     add_to_output: bool,
     bsr_options: dict[str, Any] | None,
     device,
+    sumfac_plan=None,
 ):
     # Set-up launch arguments
     domain_elt_arg = domain.element_arg_value(device=device)
@@ -1427,7 +1858,187 @@ def _launch_integrate_kernel(
             )
         )
 
-        if nodal:
+        is_side_sumfac = False
+        if sumfac_plan is not None:
+            from warp._src.fem.sumfac import side_kernels as sumfac_side_kernels  # noqa: PLC0415 (circular import)
+
+            is_side_sumfac = isinstance(sumfac_plan, sumfac_side_kernels.SumfacSidePlan)
+
+        if is_side_sumfac:
+            from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+
+            nodes_per_element = sumfac_plan.nodes_per_element
+
+            end_ops_arr, end_ops_t_arr, tang_ops_arr, tang_ops_t_arr = sumfac_plan.operator_arrays(
+                accumulate_dtype, device
+            )
+            input_eval_arg = sumfac_plan.cell_field.EvalArg()
+            sumfac_plan.cell_field.fill_eval_arg(input_eval_arg, device)
+
+            face_map, active_cells = sumfac_side_kernels.get_side_gather_arrays(
+                domain, device, temporary_store=temporary_store
+            )
+            active_cell_count = active_cells.shape[0]
+
+            staging = cache.borrow_temporary(
+                temporary_store,
+                shape=(active_cell_count, nodes_per_element),
+                dtype=accumulate_dtype,
+                device=device,
+            )
+
+            if active_cell_count > 0:
+                wp.launch_tiled(
+                    kernel,
+                    dim=[active_cell_count],
+                    inputs=[
+                        qp_arg,
+                        domain_elt_arg,
+                        domain_elt_index_arg,
+                        field_arg_values,
+                        value_struct_values,
+                        input_eval_arg,
+                        end_ops_arr,
+                        end_ops_t_arr,
+                        tang_ops_arr,
+                        tang_ops_t_arr,
+                        face_map,
+                        active_cells,
+                        # Plain runtime-valued loop bound (always 2): keeps the
+                        # kernel's axis/face loops dynamic so their tile
+                        # temporaries are emitted (and their shared memory
+                        # allocated) once instead of per unrolled iteration.
+                        2,
+                        staging,
+                    ],
+                    block_dim=sumfac_side_kernels.sumfac_side_block_dim(device),
+                    device=device,
+                )
+
+                scatter_kernel = sumfac_side_kernels.get_sumfac_side_scatter_kernel(
+                    domain.geometry,
+                    test.space,
+                    test.space_partition,
+                    staging_dtype=accumulate_dtype,
+                    output_dtype=type_scalar_type(output_dtype),
+                )
+                wp.launch(
+                    scatter_kernel,
+                    dim=(active_cell_count, nodes_per_element),
+                    inputs=[
+                        domain.geometry.cell_arg_value(device),
+                        test.space.topology.full_space_topology().topo_arg_value(device),
+                        test.space_partition.partition_arg_value(device),
+                        active_cells,
+                        staging,
+                        output_view,
+                    ],
+                    device=device,
+                )
+
+            staging.release()
+        elif sumfac_plan is not None:
+            from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+
+            element_count = domain.element_count()
+            nodes_per_element = sumfac_plan.nodes_per_element
+
+            interp_arr, deriv_arr = sumfac_plan.operator_arrays(accumulate_dtype, device)
+
+            staging = cache.borrow_temporary(
+                temporary_store,
+                shape=(element_count, nodes_per_element),
+                dtype=accumulate_dtype,
+                device=device,
+            )
+
+            if sumfac_plan.qfunction == "extracted":
+                # Two-kernel D-stage: `kernel` is the one-thread-per-quadrature-
+                # point extraction kernel (curvilinear-correct per-point
+                # geometry, no block-redundant work); the integrand-independent
+                # B^T consume kernel contracts the coefficient arrays.
+                points_per_element = sumfac_plan.q**sumfac_plan.dim
+                channels = 1 + (sumfac_plan.dim if sumfac_plan.test_uses_grad else 0)
+                fq = cache.borrow_temporary(
+                    temporary_store,
+                    shape=(element_count, channels, points_per_element),
+                    dtype=accumulate_dtype,
+                    device=device,
+                )
+                wp.launch(
+                    kernel,
+                    dim=(element_count, points_per_element),
+                    inputs=[
+                        qp_arg,
+                        domain_elt_arg,
+                        domain_elt_index_arg,
+                        field_arg_values,
+                        value_struct_values,
+                        fq,
+                    ],
+                    device=device,
+                )
+                consume_kernel = sumfac_kernels.get_sumfac_qf_consume_kernel(
+                    n=sumfac_plan.n,
+                    q=sumfac_plan.q,
+                    dim=sumfac_plan.dim,
+                    element_batch=sumfac_plan.element_batch,
+                    test_uses_grad=sumfac_plan.test_uses_grad,
+                    accumulate_dtype=accumulate_dtype,
+                )
+                wp.launch_tiled(
+                    consume_kernel,
+                    dim=[element_count // sumfac_plan.element_batch],
+                    inputs=[fq, interp_arr, deriv_arr, staging],
+                    block_dim=sumfac_kernels.sumfac_block_dim(device),
+                    device=device,
+                )
+                fq.release()
+            else:
+                input_eval_arg = sumfac_plan.input_field.EvalArg()
+                sumfac_plan.input_field.fill_eval_arg(input_eval_arg, device)
+
+                wp.launch_tiled(
+                    kernel,
+                    dim=[element_count // sumfac_plan.element_batch],
+                    inputs=[
+                        qp_arg,
+                        domain_elt_arg,
+                        domain_elt_index_arg,
+                        field_arg_values,
+                        value_struct_values,
+                        input_eval_arg,
+                        interp_arr,
+                        deriv_arr,
+                        staging,
+                    ],
+                    block_dim=sumfac_kernels.sumfac_block_dim(device),
+                    device=device,
+                )
+
+            scatter_kernel = sumfac_kernels.get_sumfac_scatter_kernel(
+                domain,
+                test.space,
+                test.space_partition,
+                staging_dtype=accumulate_dtype,
+                output_dtype=type_scalar_type(output_dtype),
+            )
+            wp.launch(
+                scatter_kernel,
+                dim=(element_count, nodes_per_element),
+                inputs=[
+                    domain_elt_arg,
+                    domain_elt_index_arg,
+                    test.space.topology.topo_arg_value(device),
+                    test.space_partition.partition_arg_value(device),
+                    staging,
+                    output_view,
+                ],
+                device=device,
+            )
+
+            staging.release()
+        elif nodal:
             wp.launch(
                 kernel=kernel,
                 dim=(test.space_restriction.node_count(), test.node_dof_count),
@@ -1520,23 +2131,165 @@ def _launch_integrate_kernel(
 
     if nodal:
         nnz = test.space_restriction.node_count()
+    elif sumfac_plan is not None:
+        # Closed-form block-diagonal pattern laid over every partition row;
+        # blocks of elements outside the integration domain hold zeros
+        nnz = test.space_partition.node_count() * sumfac_plan.nodes_per_element
     else:
         nnz = test.space_restriction.total_node_element_count() * trial.space.topology.MAX_NODES_PER_ELEMENT
 
-    triplet_rows = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
-    triplet_cols = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
-    triplet_values = cache.borrow_temporary(
-        temporary_store,
-        shape=(
-            nnz,
-            test.node_dof_count,
-            trial.node_dof_count,
-        ),
-        dtype=output_dtype,
-        device=device,
-    )
+    if output is not None:
+        if output.nrow != test.space_partition.node_count() or output.ncol != trial.space_partition.node_count():
+            raise RuntimeError(
+                f"Output matrix must have {test.space_partition.node_count()} rows and {trial.space_partition.node_count()} columns of blocks"
+            )
+        if output.block_shape != getattr(block_type, "_shape_", (1, 1)):
+            raise RuntimeError(f"Output matrix blocks must have shape {getattr(block_type, '_shape_', (1, 1))}")
 
-    if nodal:
+    sparse_bsr_options, capacity_policy, construction_policy = _normalize_fem_bsr_options(bsr_options)
+    topology = sparse_bsr_options.get("topology", "compact")
+    padded_bsr = topology == "padded"
+
+    if capacity_policy == _BSR_CAPACITY_REUSE:
+        if add_to_output:
+            raise RuntimeError("fem.integrate() does not support bsr_options['capacity']='reuse' with add=True")
+        if output is None:
+            raise RuntimeError("fem.integrate() with bsr_options['capacity']='reuse' requires an output matrix")
+
+    output_values_require_grad = isinstance(output, BsrMatrix) and output.values.requires_grad
+    row_compress_bsr = construction_policy in (_BSR_CONSTRUCTION_ROW_COMPRESS, _BSR_CONSTRUCTION_AUTO)
+
+    if sumfac_plan is not None:
+        if padded_bsr:
+            raise NotImplementedError(
+                "assembly='sumfac' does not support bsr_options['topology']='padded'; the fused kernel "
+                "writes the compact block-diagonal topology directly"
+            )
+        # The closed-form block-diagonal topology is already compact, sorted,
+        # and duplicate-free; the row-compression pre-pass would only
+        # recompute what is known.
+        row_compress_bsr = False
+
+    # If we're doing row-local compression or padded assembly,
+    # we need to pre-compute per-row capacity.
+    bsr_result = None if add_to_output else output
+
+    if row_compress_bsr or padded_bsr:
+        precomputed_offsets_topology = "compact" if nodal else "padded"
+
+        if bsr_result is None:
+            bsr_result = bsr_zeros(
+                rows_of_blocks=test.space_partition.node_count(),
+                cols_of_blocks=trial.space_partition.node_count(),
+                block_type=block_type,
+                device=device,
+                topology=precomputed_offsets_topology,
+            )
+        else:
+            bsr_set_zero(bsr_result, topology=precomputed_offsets_topology)
+
+        if nodal:
+            wp.launch(
+                _count_integrate_bsr_rows_from_sorted_rows,
+                dim=bsr_result.nrow + 1,
+                device=bsr_result.device,
+                inputs=[bsr_result.nrow, nnz, test.space_restriction.node_partition_indices(), bsr_result.offsets],
+            )
+            array_scan(in_array=bsr_result.offsets, out_array=bsr_result.offsets, inclusive=False)
+        else:
+            wp.launch(
+                _fill_integrate_bsr_offsets_from_row_groups,
+                dim=bsr_result.nrow + 1,
+                device=bsr_result.device,
+                inputs=[
+                    bsr_result.nrow,
+                    test.space_restriction.partition_element_offsets(),
+                    trial.space.topology.MAX_NODES_PER_ELEMENT,
+                    bsr_result.offsets,
+                    bsr_result.row_counts,
+                ],
+            )
+        if capacity_policy == _BSR_CAPACITY_AUTO:
+            bsr_result.notify_nnz_changed(nnz=nnz)
+        else:
+            _require_bsr_capacity(bsr_result, nnz, "fem.integrate()")
+            bsr_result.nnz = nnz
+    elif bsr_result is None:
+        bsr_result = bsr_zeros(
+            rows_of_blocks=test.space_partition.node_count(),
+            cols_of_blocks=trial.space_partition.node_count(),
+            block_type=block_type,
+            device=device,
+        )
+
+    if sumfac_plan is not None:
+        # The fused kernel stores element-local blocks directly into the
+        # matrix values; no triplet staging is needed.
+        triplet_rows = triplet_cols = triplet_values = None
+    elif row_compress_bsr:
+        triplet_rows = None
+        triplet_cols = bsr_result.columns[:nnz]
+        triplet_values = _bsr_values_as_3d_array(bsr_result.values[:nnz], bsr_result.block_shape)
+    else:
+        triplet_rows = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
+        triplet_cols = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
+        triplet_values = cache.borrow_temporary(
+            temporary_store,
+            shape=(
+                nnz,
+                test.node_dof_count,
+                trial.node_dof_count,
+            ),
+            dtype=output_dtype,
+            device=device,
+        )
+
+    if sumfac_plan is not None:
+        from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+
+        element_count = domain.element_count()
+        nodes_per_element = sumfac_plan.nodes_per_element
+
+        interp_arr, deriv_arr = sumfac_plan.operator_arrays(accumulate_dtype, device)
+
+        if capacity_policy == _BSR_CAPACITY_REUSE:
+            _require_bsr_capacity(bsr_result, nnz, "fem.integrate()")
+        sumfac_kernels.set_block_diagonal_topology(bsr_result, nodes_per_element)
+
+        # Scalar 2D view of the matrix values: with the block-diagonal
+        # topology, matrix row r owns exactly the `nodes_per_element`
+        # consecutive value entries starting at r * nodes_per_element, so the
+        # fused kernel tile_stores column j of element e's local block at
+        # view offset (e * nodes_per_element, j).
+        values_view = wp.array(
+            ptr=bsr_result.values.ptr,
+            capacity=bsr_result.values.capacity,
+            device=device,
+            dtype=output_dtype,
+            shape=(bsr_result.nrow, nodes_per_element),
+        )
+        if element_count * nodes_per_element != bsr_result.nrow:
+            # Partial domain: blocks of uncovered elements must hold zeros
+            # (storage may be freshly allocated or reused, hence undefined)
+            values_view.zero_()
+
+        wp.launch_tiled(
+            kernel,
+            dim=[element_count],
+            inputs=[
+                qp_arg,
+                domain_elt_arg,
+                domain_elt_index_arg,
+                field_arg_values,
+                value_struct_values,
+                interp_arr,
+                deriv_arr,
+                values_view,
+            ],
+            block_dim=sumfac_kernels.sumfac_block_dim(device),
+            device=device,
+        )
+    elif nodal:
         wp.launch(
             kernel=kernel,
             dim=triplet_values.shape,
@@ -1594,7 +2347,10 @@ def _launch_integrate_kernel(
                 category=UserWarning,
                 stacklevel=2,
             )
-            triplet_rows.fill_(-1)
+            if triplet_rows:
+                triplet_rows.fill_(-1)
+            else:
+                triplet_cols.fill_(-1)
         else:
             dispatch_kernel, dispatch_tile_size = auxiliary_kernels[0]
             trial_partition_arg = trial.space_partition.partition_arg_value(device)
@@ -1653,31 +2409,23 @@ def _launch_integrate_kernel(
             device=device,
         )
 
-    if output is not None:
-        if output.nrow != test.space_partition.node_count() or output.ncol != trial.space_partition.node_count():
-            raise RuntimeError(
-                f"Output matrix must have {test.space_partition.node_count()} rows and {trial.space_partition.node_count()} columns of blocks"
-            )
-
-    if output is None or add_to_output:
-        bsr_result = bsr_zeros(
-            rows_of_blocks=test.space_partition.node_count(),
-            cols_of_blocks=trial.space_partition.node_count(),
-            block_type=block_type,
-            device=device,
-        )
+    if sumfac_plan is not None:
+        # Topology and values were written in place by the fused kernel
+        pass
+    elif row_compress_bsr:
+        bsr_compress(bsr_result, inplace=not output_values_require_grad, **sparse_bsr_options)
     else:
-        bsr_result = output
-
-    bsr_set_from_triplets(bsr_result, triplet_rows, triplet_cols, triplet_values, **(bsr_options or {}))
-
-    # Do not wait for garbage collection
-    triplet_values.release()
-    triplet_rows.release()
-    triplet_cols.release()
+        if capacity_policy == _BSR_CAPACITY_REUSE and topology == "compact":
+            _require_bsr_capacity(bsr_result, nnz, "fem.integrate()")
+        bsr_set_from_triplets(
+            bsr_result, rows=triplet_rows, columns=triplet_cols, values=triplet_values, **sparse_bsr_options
+        )
+        triplet_rows.release()
+        triplet_values.release()
+        triplet_cols.release()
 
     if add_to_output:
-        output += bsr_result
+        bsr_axpy(y=output, x=bsr_result, topology=topology)
     else:
         output = bsr_result
 
@@ -1697,8 +2445,8 @@ _NODE_OPERATORS = {
 
 def _pick_assembly_strategy(assembly: str | None, operators: dict[str, set[Operator]], arguments: IntegrandArguments):
     if assembly is not None:
-        if assembly not in ("generic", "nodal", "dispatch"):
-            raise ValueError(f"Invalid assembly strategy'{assembly}'")
+        if assembly not in ("generic", "nodal", "dispatch", "sumfac"):
+            raise ValueError(f"Invalid assembly strategy '{assembly}'")
         return assembly
 
     test_operators = operators.get(arguments.test_name, set())
@@ -1724,6 +2472,7 @@ def integrate(
     assembly: str | None = None,
     add: bool = False,
     bsr_options: dict[str, Any] | None = None,
+    assembly_options: dict[str, Any] | None = None,
 ):
     """
     Integrates a constant, linear or bilinear form, and returns a scalar, array, or sparse matrix, respectively.
@@ -1744,9 +2493,34 @@ def integrate(
             - "nodal": For linear or bilinear forms, use the test function nodes as the quadrature points. Assumes Lagrange interpolation functions are used, and no differential or DG operator is evaluated on the test or trial functions.
             - "generic": Single-pass integration and shape-function evaluation. Makes no assumption about the integrand's content, but may lead to many redundant computations.
             - "dispatch": For linear or bilinear forms, first evaluate the form at quadrature points then dispatch to nodes in a second pass. More efficient for integrands that are expensive to evaluate. Incompatible with `at_node` and `node_index` operators on test or trial functions.
+            - "sumfac": Opt-in sum-factorized (fused ``B^T D B``) integration for high-order tensor-product discontinuous-Galerkin forms, covering the matrix-free apply of linear forms (over cell domains and, with sum-factorized face traces, over ``Grid2D``/``Grid3D`` side domains) and the assembly of bilinear forms over cell domains. Requires a 2D/3D tensor-product geometry, a scalar discontinuous tensor-product polynomial space (the same space for test, trial, and input fields), a matching tensor-product :class:`RegularQuadrature`, and value/gradient operators only on the test, trial, and input fields (side forms additionally support the jump/average trace combinations, which expand to those operators). Does not support differentiation (backward kernels, differentiable inputs or outputs) or bilinear side forms. Never selected automatically; forms that do not qualify raise a ``NotImplementedError`` describing the first unmet requirement.
             - `None` (default): Automatically picks a suitable assembly strategy (either "generic" or "dispatch")
         add: If True and `output` is provided, add the integration result to `output` instead of replacing its content
-        bsr_options: Additional options to be passed to the sparse matrix construction algorithm. See :func:`warp.sparse.bsr_set_from_triplets()`
+        bsr_options: Additional options to be passed to the sparse matrix construction algorithm.
+          See :func:`warp.sparse.bsr_set_from_triplets()` and :func:`warp.sparse.bsr_compress()`.
+          In addition to sparse options, ``capacity="auto"`` allows FEM to grow sparse storage as needed, while
+          ``capacity="reuse"`` requires existing ``output`` arrays to be large enough and does not grow them.
+          Omitting ``construction`` uses ``"triplets"``. ``construction="auto"`` opts into automatic
+          selection of a suitable construction method, whose choices may change in future releases;
+          currently it uses row compression for bilinear assembly when possible.
+          ``construction="triplets"`` forces temporary COO triplet construction, while
+          ``construction="row_compress"`` forces row-ordered candidate writes followed by
+          :func:`warp.sparse.bsr_compress()`. For row compression, :func:`warp.sparse.bsr_compress()`
+          uses ``inplace=False`` when ``output.values.requires_grad`` is true; non-differentiable outputs use
+          in-place compression for the lowest memory overhead.
+        assembly_options: Additional options for the selected assembly strategy. Only supported with
+          ``assembly="sumfac"``; unsupported combinations raise a descriptive error (no silent fallback).
+          ``element_batch`` (default ``1``) selects the number of elements processed per block by the fused
+          linear cell kernel: with ``element_batch=E_b > 1`` the contraction stages run as wide GEMM panels
+          over ``E_b`` elements, amortizing the per-shape padding of the underlying tile GEMMs; currently 2D
+          linear cell forms only, and the domain element count must be divisible by ``E_b``.
+          ``qfunction`` (default ``"seeded"``) selects the D-stage strategy of the linear cell apply:
+          ``"seeded"`` evaluates the integrand inside the fused kernel (each block evaluates its elements'
+          quadrature points redundantly on every thread), while ``"extracted"`` first runs a
+          one-thread-per-quadrature-point extraction kernel (geometry evaluated per point, so curved and
+          non-affine elements are fully supported) and then contracts the extracted coefficient arrays with
+          an integrand-independent ``B^T`` tile kernel; currently 2D linear cell forms only. Both options
+          compose (``{"element_batch": 4, "qfunction": "extracted"}``).
     """
     if fields is None:
         fields = {}
@@ -1797,6 +2571,75 @@ def integrate(
     assembly = _pick_assembly_strategy(assembly, arguments=arguments, operators=integrand.operators)
     # print("assembly for ", integrand.name, ":", strategy)
 
+    if assembly_options is not None and assembly != "sumfac":
+        raise ValueError(f"assembly_options is only supported with assembly='sumfac'; got assembly={assembly!r}")
+
+    sumfac_plan = None
+    if assembly != "nodal":
+        if quadrature is None:
+            order = sum(field.degree for field in fields.values())
+            quadrature = RegularQuadrature(domain=domain, order=order)
+        elif domain != quadrature.domain:
+            raise ValueError("Incompatible integration and quadrature domain")
+
+        # Explicit sum-factorization opt-in: the form must qualify, otherwise
+        # a descriptive error is raised (no silent fallback). The plain test
+        # and trial fields are kept (no LocalTestField wrapping); the plan
+        # substitutes the seed/injected fields in arguments.field_args so the
+        # fused B^T D B kernel can be generated. The staged kernel has no
+        # autodiff support, so differentiation requests are rejected up front.
+        if assembly == "sumfac":
+            from warp._src.fem.sumfac import kernels as sumfac_kernels  # noqa: PLC0415 (circular import)
+            from warp._src.fem.sumfac import side_kernels as sumfac_side_kernels  # noqa: PLC0415 (circular import)
+
+            _validate_sumfac_request(
+                domain, test, trial, quadrature, output, kernel_options, accumulate_dtype, arguments.field_args
+            )
+
+            sumfac_options = dict(assembly_options or {})
+            element_batch = sumfac_options.pop("element_batch", 1)
+            qfunction = sumfac_options.pop("qfunction", "seeded")
+            if sumfac_options:
+                raise ValueError(
+                    f"Unknown assembly_options keys for assembly='sumfac': {sorted(sumfac_options)}; "
+                    "supported keys: 'element_batch', 'qfunction'"
+                )
+            if not isinstance(element_batch, int) or element_batch < 1:
+                raise ValueError(f"assembly_options['element_batch'] must be a positive int; got {element_batch!r}")
+            if qfunction not in ("seeded", "extracted"):
+                raise ValueError(f"assembly_options['qfunction'] must be 'seeded' or 'extracted'; got {qfunction!r}")
+
+            if domain.element_kind == ElementKind.SIDE:
+                if element_batch != 1:
+                    raise NotImplementedError(
+                        "assembly_options['element_batch'] > 1 is not implemented for side (DG face) domains; "
+                        "only the linear cell apply supports element batching"
+                    )
+                if qfunction != "seeded":
+                    raise NotImplementedError(
+                        "assembly_options['qfunction']='extracted' is not implemented for side (DG face) domains; "
+                        "only the linear cell apply supports the extracted D stage"
+                    )
+                sumfac_plan = sumfac_side_kernels.make_sumfac_side_plan(integrand, arguments, test, quadrature, domain)
+            elif trial is None:
+                sumfac_plan = sumfac_kernels.make_sumfac_plan(
+                    integrand, arguments, test, quadrature, domain, element_batch=element_batch, qfunction=qfunction
+                )
+            else:
+                if element_batch != 1:
+                    raise NotImplementedError(
+                        "assembly_options['element_batch'] > 1 is not implemented for bilinear (assembly) forms; "
+                        "only the linear cell apply supports element batching"
+                    )
+                if qfunction != "seeded":
+                    raise NotImplementedError(
+                        "assembly_options['qfunction']='extracted' is not implemented for bilinear (assembly) "
+                        "forms; only the linear cell apply supports the extracted D stage"
+                    )
+                sumfac_plan = sumfac_kernels.make_sumfac_bilinear_plan(
+                    integrand, arguments, test, trial, quadrature, domain
+                )
+
     if assembly == "dispatch":
         if test is not None:
             test = LocalTestField(test)
@@ -1816,12 +2659,6 @@ def integrate(
             raise ValueError(
                 "Bilinear nodal integration requires test and trial to be defined on the same function space"
             )
-    else:
-        if quadrature is None:
-            order = sum(field.degree for field in fields.values())
-            quadrature = RegularQuadrature(domain=domain, order=order)
-        elif domain != quadrature.domain:
-            raise ValueError("Incompatible integration and quadrature domain")
 
     # Canonicalize types
     accumulate_dtype = type_to_warp(accumulate_dtype)
@@ -1845,6 +2682,7 @@ def integrate(
         accumulate_dtype=accumulate_dtype,
         output_dtype=output_dtype,
         kernel_options=kernel_options,
+        sumfac_plan=sumfac_plan,
     )
 
     auxiliary_kernels = _generate_auxiliary_kernels(
@@ -1875,6 +2713,7 @@ def integrate(
         add_to_output=add,
         bsr_options=bsr_options,
         device=device,
+        sumfac_plan=sumfac_plan,
     )
 
 
@@ -2272,7 +3111,8 @@ def get_interpolate_jacobian_at_nodes_kernel(
                     trial_partition_arg,
                     trial.space.topology.element_node_index(domain_arg, trial_topo_arg, element_index, trial_node),
                 )
-                triplet_rows[block_offset] = partition_node_index
+                if triplet_rows:
+                    triplet_rows[block_offset] = partition_node_index
                 triplet_cols[block_offset] = trial_node_index
 
             if wp.static(reduction == "first"):
@@ -2389,7 +3229,8 @@ def get_interpolate_jacobian_at_quadrature_kernel(
                 )
             else:
                 trial_node_index = NULL_NODE_INDEX  # will get ignored when converting to bsr
-            triplet_rows[block_offset] = qp_index
+            if triplet_rows:
+                triplet_rows[block_offset] = qp_index
             triplet_cols[block_offset] = trial_node_index
 
     return interpolate_jacobian_kernel_fn
@@ -2613,14 +3454,13 @@ def _allocate_interpolate_jacobian_triplets(
     dest: BsrMatrix,
     temporary_store: cache.TemporaryStore | None,
 ):
-    nnz = evaluation_point_count * trial.space.topology.MAX_NODES_PER_ELEMENT
+    _validate_interpolate_jacobian_dest(
+        point_index_count=point_index_count,
+        trial=trial,
+        dest=dest,
+    )
 
-    if dest.nrow != point_index_count or dest.ncol != trial.space_partition.node_count():
-        raise RuntimeError(
-            f"'dest' matrix must have {point_index_count} rows and {trial.space_partition.node_count()} columns of blocks"
-        )
-    if dest.block_shape[1] != trial.node_dof_count:
-        raise RuntimeError(f"'dest' matrix blocks must have {trial.node_dof_count} columns")
+    nnz = evaluation_point_count * trial.space.topology.MAX_NODES_PER_ELEMENT
 
     device = dest.device
     triplet_rows = cache.borrow_temporary(temporary_store, shape=(nnz,), dtype=int, device=device)
@@ -2633,6 +3473,36 @@ def _allocate_interpolate_jacobian_triplets(
     )
     triplet_rows.fill_(-1)
     return triplet_rows, triplet_cols, triplet_values
+
+
+def _validate_interpolate_jacobian_dest(
+    point_index_count: int,
+    trial: TrialField,
+    dest: BsrMatrix,
+):
+    if dest.nrow != point_index_count or dest.ncol != trial.space_partition.node_count():
+        raise RuntimeError(
+            f"'dest' matrix must have {point_index_count} rows and {trial.space_partition.node_count()} columns of blocks"
+        )
+    if dest.block_shape[1] != trial.node_dof_count:
+        raise RuntimeError(f"'dest' matrix blocks must have {trial.node_dof_count} columns")
+
+
+def _interpolate_jacobian_row_compress_storage(
+    dest: BsrMatrix,
+    capacity_nnz: int,
+    capacity_policy: str,
+):
+    if capacity_policy == _BSR_CAPACITY_AUTO:
+        dest.notify_nnz_changed(nnz=capacity_nnz)
+    else:
+        _require_bsr_capacity(dest, capacity_nnz, "fem.interpolate()")
+        dest.nnz = capacity_nnz
+
+    candidate_columns = dest.columns[:capacity_nnz]
+    candidate_columns.fill_(-1)
+    candidate_values = _bsr_values_as_3d_array(dest.values[:capacity_nnz], dest.block_shape)
+    return None, candidate_columns, candidate_values
 
 
 def _launch_interpolate_kernel(
@@ -2657,6 +3527,12 @@ def _launch_interpolate_kernel(
     # Set-up launch arguments
     elt_arg = domain.element_arg_value(device=device)
     elt_index_arg = domain.element_index_arg_value(device=device)
+
+    sparse_bsr_options, capacity_policy, construction_policy = _normalize_fem_bsr_options(bsr_options)
+    topology = sparse_bsr_options.get("topology", "compact")
+    padded_bsr = topology == "padded"
+    dest_values_require_grad = isinstance(dest, BsrMatrix) and dest.values.requires_grad
+    row_compress_bsr = construction_policy in (_BSR_CONSTRUCTION_ROW_COMPRESS, _BSR_CONSTRUCTION_AUTO)
 
     for k, v in fields.items():
         if not isinstance(v, GeometryDomain):
@@ -2694,25 +3570,85 @@ def _launch_interpolate_kernel(
         else:
             trial_partition_arg = trial.space_partition.partition_arg_value(device)
             trial_topology_arg = trial.space_partition.space_topology.topo_arg_value(device)
-
-            triplet_rows, triplet_cols, triplet_values = _allocate_interpolate_jacobian_triplets(
-                evaluation_point_count=space_restriction.node_count()
-                if reduction == "first"
-                else space_restriction.total_node_element_count(),
-                point_index_count=space_restriction.space_partition.node_count(),
-                trial=trial,
-                dest=dest,
-                temporary_store=temporary_store,
+            max_nodes_per_element = trial.space.topology.MAX_NODES_PER_ELEMENT
+            evaluation_point_count = (
+                space_restriction.node_count() if reduction == "first" else space_restriction.total_node_element_count()
             )
+
+            if row_compress_bsr and reduction == "first":
+                if construction_policy == _BSR_CONSTRUCTION_AUTO:
+                    row_compress_bsr = False
+                else:
+                    raise RuntimeError(
+                        "fem.interpolate() with bsr_options['construction']='row_compress' does not support "
+                        "reduction='first' with a space restriction"
+                    )
+
+            if row_compress_bsr:
+                _validate_interpolate_jacobian_dest(
+                    point_index_count=space_restriction.space_partition.node_count(),
+                    trial=trial,
+                    dest=dest,
+                )
+                capacity_nnz = evaluation_point_count * max_nodes_per_element
+                bsr_set_zero(dest, topology="padded")
+                wp.launch(
+                    _fill_integrate_bsr_offsets_from_row_groups,
+                    dim=dest.nrow + 1,
+                    device=dest.device,
+                    inputs=[
+                        dest.nrow,
+                        space_restriction.partition_element_offsets(),
+                        max_nodes_per_element,
+                        dest.offsets,
+                        dest.row_counts,
+                    ],
+                )
+                triplet_rows, triplet_cols, triplet_values = _interpolate_jacobian_row_compress_storage(
+                    dest=dest,
+                    capacity_nnz=capacity_nnz,
+                    capacity_policy=capacity_policy,
+                )
+            else:
+                triplet_rows, triplet_cols, triplet_values = _allocate_interpolate_jacobian_triplets(
+                    evaluation_point_count=evaluation_point_count,
+                    point_index_count=space_restriction.space_partition.node_count(),
+                    trial=trial,
+                    dest=dest,
+                    temporary_store=temporary_store,
+                )
+
+                if padded_bsr:
+                    capacity_nnz = space_restriction.total_node_element_count() * max_nodes_per_element
+                    bsr_set_zero(dest, topology="padded")
+                    wp.launch(
+                        _fill_integrate_bsr_offsets_from_row_groups,
+                        dim=dest.nrow + 1,
+                        device=dest.device,
+                        inputs=[
+                            dest.nrow,
+                            space_restriction.partition_element_offsets(),
+                            max_nodes_per_element,
+                            dest.offsets,
+                            dest.row_counts,
+                        ],
+                    )
+                    if capacity_policy == _BSR_CAPACITY_AUTO:
+                        dest.notify_nnz_changed(nnz=capacity_nnz)
+                    else:
+                        _require_bsr_capacity(dest, capacity_nnz, "fem.interpolate()")
+                        dest.nnz = capacity_nnz
+                elif capacity_policy == _BSR_CAPACITY_REUSE:
+                    _require_bsr_capacity(dest, evaluation_point_count * max_nodes_per_element, "fem.interpolate()")
 
             wp.launch(
                 kernel=kernel,
-                dim=(interpolation_point_count, trial.space.topology.MAX_NODES_PER_ELEMENT, trial.node_dof_count),
+                dim=(interpolation_point_count, max_nodes_per_element, trial.node_dof_count),
                 inputs=[
                     elt_arg,
                     elt_index_arg,
                     trial_partition_arg,
-                    trial.space.topology.MAX_NODES_PER_ELEMENT,
+                    max_nodes_per_element,
                     dest_space_restriction_arg,
                     dest_basis_arg,
                     dest_topo_arg,
@@ -2725,7 +3661,14 @@ def _launch_interpolate_kernel(
                 device=device,
             )
 
-            bsr_set_from_triplets(dest, triplet_rows, triplet_cols, triplet_values, **(bsr_options or {}))
+            if row_compress_bsr:
+                bsr_compress(dest, inplace=not dest_values_require_grad, **sparse_bsr_options)
+            else:
+                bsr_set_from_triplets(dest, triplet_rows, triplet_cols, triplet_values, **sparse_bsr_options)
+
+                triplet_rows.release()
+                triplet_values.release()
+                triplet_cols.release()
 
         return
 
@@ -2767,18 +3710,67 @@ def _launch_interpolate_kernel(
 
     trial_partition_arg = trial.space_partition.partition_arg_value(device)
     trial_topology_arg = trial.space_partition.space_topology.topo_arg_value(device)
+    max_nodes_per_element = trial.space.topology.MAX_NODES_PER_ELEMENT
 
-    triplet_rows, triplet_cols, triplet_values = _allocate_interpolate_jacobian_triplets(
-        evaluation_point_count=quadrature.evaluation_point_count(),
-        point_index_count=qp_index_count,
-        trial=trial,
-        dest=dest,
-        temporary_store=temporary_store,
-    )
+    if row_compress_bsr and qp_eval_count != qp_index_count and not padded_bsr:
+        if construction_policy == _BSR_CONSTRUCTION_AUTO:
+            row_compress_bsr = False
+        else:
+            raise RuntimeError(
+                "fem.interpolate() with bsr_options['construction']='row_compress' requires a quadrature with "
+                "matching evaluation and indexed point counts"
+            )
+
+    if padded_bsr and qp_eval_count != qp_index_count:
+        raise RuntimeError(
+            "fem.interpolate() with bsr_options['topology']='padded' requires a quadrature with matching evaluation "
+            "and indexed point counts"
+        )
+
+    if row_compress_bsr:
+        _validate_interpolate_jacobian_dest(point_index_count=qp_index_count, trial=trial, dest=dest)
+        capacity_nnz = qp_index_count * max_nodes_per_element
+        bsr_set_zero(dest, topology="padded")
+        wp.launch(
+            _fill_bsr_offsets_with_uniform_capacity,
+            dim=dest.nrow + 1,
+            device=dest.device,
+            inputs=[dest.nrow, max_nodes_per_element, dest.offsets, dest.row_counts],
+        )
+        triplet_rows, triplet_cols, triplet_values = _interpolate_jacobian_row_compress_storage(
+            dest=dest,
+            capacity_nnz=capacity_nnz,
+            capacity_policy=capacity_policy,
+        )
+    else:
+        triplet_rows, triplet_cols, triplet_values = _allocate_interpolate_jacobian_triplets(
+            evaluation_point_count=qp_eval_count,
+            point_index_count=qp_index_count,
+            trial=trial,
+            dest=dest,
+            temporary_store=temporary_store,
+        )
+
+        if padded_bsr:
+            capacity_nnz = qp_index_count * max_nodes_per_element
+            bsr_set_zero(dest, topology="padded")
+            wp.launch(
+                _fill_bsr_offsets_with_uniform_capacity,
+                dim=dest.nrow + 1,
+                device=dest.device,
+                inputs=[dest.nrow, max_nodes_per_element, dest.offsets, dest.row_counts],
+            )
+            if capacity_policy == _BSR_CAPACITY_AUTO:
+                dest.notify_nnz_changed(nnz=capacity_nnz)
+            else:
+                _require_bsr_capacity(dest, capacity_nnz, "fem.interpolate()")
+                dest.nnz = capacity_nnz
+        elif capacity_policy == _BSR_CAPACITY_REUSE:
+            _require_bsr_capacity(dest, qp_eval_count * max_nodes_per_element, "fem.interpolate()")
 
     wp.launch(
         kernel=kernel,
-        dim=(quadrature.evaluation_point_count(), trial.space.topology.MAX_NODES_PER_ELEMENT, trial.node_dof_count),
+        dim=(qp_eval_count, max_nodes_per_element, trial.node_dof_count),
         inputs=[
             qp_arg,
             qp_element_index_arg,
@@ -2786,7 +3778,7 @@ def _launch_interpolate_kernel(
             elt_index_arg,
             trial_partition_arg,
             trial_topology_arg,
-            trial.space.topology.MAX_NODES_PER_ELEMENT,
+            max_nodes_per_element,
             field_arg_values,
             value_struct_values,
             triplet_rows,
@@ -2796,11 +3788,14 @@ def _launch_interpolate_kernel(
         device=device,
     )
 
-    bsr_set_from_triplets(dest, triplet_rows, triplet_cols, triplet_values, **(bsr_options or {}))
+    if row_compress_bsr:
+        bsr_compress(dest, inplace=not dest_values_require_grad, **sparse_bsr_options)
+    else:
+        bsr_set_from_triplets(dest, triplet_rows, triplet_cols, triplet_values, **sparse_bsr_options)
 
-    triplet_values.release()
-    triplet_rows.release()
-    triplet_cols.release()
+        triplet_rows.release()
+        triplet_values.release()
+        triplet_cols.release()
 
 
 @integrand
@@ -2834,7 +3829,7 @@ def interpolate(
 
          - a :class:`DiscreteField`, or restriction of a discrete field to a domain (from :func:`make_restriction`);
          - a normal warp ``array``;
-         - a sparse matrix (:class:`warp.sparse.BsrMatrix`). This will compute the jacooian of `integrand`, assuming one of the passed fields is a trial field,
+         - a sparse matrix (:class:`warp.sparse.BsrMatrix`). This will compute the Jacobian of `integrand`, assuming one of the passed fields is a trial field,
             and that the result is a linear function of the trial field;
          - ``None``, meaning the integrand will be evaluated at the interpolation sample points, but the result will be discarded.
         at: Location of the interpolation samples. Can be either
@@ -2859,7 +3854,19 @@ def interpolate(
         device: Device on which to perform the interpolation
         kernel_options: Overloaded options to be passed to the kernel builder (e.g, ``{"enable_backward": True}``)
         temporary_store: shared pool from which to allocate temporary arrays
-        bsr_options: Additional options to be passed to the sparse matrix construction algorithm. See :func:`warp.sparse.bsr_set_from_triplets()`
+        bsr_options: Additional options to be passed to the sparse matrix construction algorithm.
+          See :func:`warp.sparse.bsr_set_from_triplets()` and :func:`warp.sparse.bsr_compress()`.
+          In addition to sparse options, ``capacity="auto"`` allows FEM to grow sparse storage as needed, while
+          ``capacity="reuse"`` requires existing ``dest`` arrays to be large enough and does not grow them.
+          Omitting ``construction`` uses ``"triplets"``. ``construction="auto"`` opts into automatic
+          selection of a suitable construction method, whose choices may change in future releases;
+          currently it uses row compression when supported and falls back to triplets for unsupported
+          interpolation cases.
+          ``construction="triplets"`` forces temporary COO triplet construction, while
+          ``construction="row_compress"`` forces row-ordered candidate writes followed by
+          :func:`warp.sparse.bsr_compress()`. Non-differentiable outputs use in-place compression for the
+          lowest memory overhead. Row compression for quadrature interpolation requires matching evaluation and
+          indexed point counts.
     """
 
     if isinstance(integrand, FieldLike):

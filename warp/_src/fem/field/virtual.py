@@ -406,6 +406,375 @@ class TrialField(AdjointField):
         return s.trial_dof
 
 
+class SeedField(AdjointField):
+    """Test-function stand-in whose value and gradient are injected seeds.
+
+    ``eval_inner`` returns a seed *value* and ``eval_grad_inner`` a seed
+    *gradient* instead of evaluating shape functions, so that the body of a
+    :func:`warp.fem.integrand` linear in the test function is reused verbatim
+    as a pointwise Q-function (the ``D`` stage of the sum-factorized
+    ``B^T D B`` pipeline, see :mod:`warp._src.fem.sumfac.qfunction`).
+
+    The seed selector is carried by the ``test_dof`` member of the
+    :class:`Sample` (``trial_dof`` for the :class:`TrialSeedField` sibling),
+    decoded branchlessly with ``get_node_index_in_element``: index ``0``
+    selects the value seed ``(v = 1, grad v = 0)`` and index ``1 + i`` the
+    gradient seed ``(v = 0, grad v = e_i)`` for spatial axis ``i``. The
+    injected gradient is expressed directly in the frame chosen by the
+    consumer (the Q-function extraction seeds *physical* unit vectors), so no
+    reference-gradient transform is applied here.
+
+    This channel was chosen over carrying seed values in the ``EvalArg``
+    because the consumer evaluates the integrand ``d + 1`` times per
+    quadrature point with different seeds: the :class:`Sample` is already a
+    per-evaluation value rebuilt in registers, whereas ``EvalArg`` data is
+    uniform per launch (or would require per-QP device arrays and the
+    associated global-memory traffic inside the fused Phase 3 kernel). It also
+    reuses the exact slot (``test_dof``) that the standard assembly kernels
+    use to select the test basis function, so the integrand transformation
+    machinery is unchanged.
+
+    Only scalar-valued spaces are supported for now; vector/tensor-valued
+    seeding would additionally need to enumerate the value degrees of freedom
+    (the ``get_node_coord`` half of the ``DofIndex``).
+
+    Args:
+        space: Scalar-valued function space of the test function being seeded.
+        space_partition: Space partition associated with the test function.
+        domain: Domain over which the seeded integrand is evaluated.
+    """
+
+    def __init__(self, space: FunctionSpace, space_partition: SpacePartition, domain: GeometryDomain):
+        if space.NODE_DOF_COUNT != 1 or space.VALUE_DOF_COUNT != 1:
+            raise NotImplementedError("SeedField is only implemented for scalar-valued function spaces")
+
+        super().__init__(space, space_partition, domain)
+
+    @classmethod
+    def from_field(cls, field: AdjointField) -> "SeedField":
+        """Build a :class:`SeedField` standing in for an existing test or trial field."""
+        return cls(field.space, field.space_partition, field.domain)
+
+    @wp.func
+    def _get_dof(s: Any):
+        return s.test_dof
+
+    def _make_eval_inner(self):
+        value_type = self.dtype
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_seed_inner(args: self.ElementEvalArg, s: self.SampleType):
+            seed_index = get_node_index_in_element(self._get_dof(s))
+            return wp.where(seed_index == 0, value_type(1.0), value_type(0.0))
+
+        return eval_seed_inner
+
+    def _make_eval_grad_inner(self):
+        if not self.gradient_valid():
+            return None
+
+        value_type = self.dtype
+        gradient_type = self.gradient_dtype
+        GRAD_DIM = self.geometry.dimension
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_seed_grad_inner(args: self.ElementEvalArg, s: self.SampleType):
+            seed_index = get_node_index_in_element(self._get_dof(s))
+            grad_seed = gradient_type()
+            for i in range(GRAD_DIM):
+                grad_seed[i] = wp.where(seed_index == i + 1, value_type(1.0), value_type(0.0))
+            return grad_seed
+
+        return eval_seed_grad_inner
+
+    def _make_eval_div_inner(self):
+        # Divergence seeding is not defined for scalar spaces
+        return None
+
+    def _make_eval_outer(self):
+        # Seeds do not distinguish inner from outer evaluation (cell domains only)
+        return self.eval_inner
+
+    def _make_eval_grad_outer(self):
+        return self.eval_grad_inner
+
+    def _make_eval_div_outer(self):
+        return None
+
+
+class TrialSeedField(SeedField):
+    """Trial-function sibling of :class:`SeedField`.
+
+    The seed selector is carried by the ``trial_dof`` member of the
+    :class:`Sample` instead of ``test_dof``, so that a bilinear integrand can
+    be seeded independently on its test and trial sides to extract the per-
+    quadrature-point coefficient channels of the assembled local matrix (the
+    ``D`` stage of the sum-factorized assembly, see
+    :mod:`warp._src.fem.sumfac.kernels`).
+    """
+
+    @wp.func
+    def _get_dof(s: Any):
+        return s.trial_dof
+
+
+class ValueInjectedField(AdjointField):
+    """Field stand-in whose value and gradient are injected per evaluation.
+
+    ``eval_inner`` returns the ``value`` member of the :class:`EvalArg` and
+    ``eval_grad_inner`` its ``gradient`` member, instead of evaluating shape
+    functions against degrees of freedom. This is the input-field sibling of
+    :class:`SeedField` used by the fused sum-factorized ``B^T D B`` kernel
+    (see :mod:`warp._src.fem.sumfac.kernels`): the kernel's ``B`` stage
+    interpolates the input field's element DOFs to the quadrature points with
+    tile contractions, then fills a fresh ``EvalArg`` per quadrature point
+    with the interpolated value and physical gradient before invoking the
+    transformed integrand, so the user's integrand body is reused verbatim
+    without re-evaluating the input basis per quadrature point.
+
+    Unlike :class:`SeedField`, whose one-hot seeds travel through the
+    ``Sample``, the injected data are arbitrary values, so they are carried by
+    the ``EvalArg`` struct; the consumer builds a fresh local ``EvalArg`` per
+    quadrature point (kernel-parameter structs are effectively immutable).
+    ``fill_eval_arg`` is therefore a host-side no-op.
+
+    Only scalar-valued spaces are supported for now, mirroring
+    :class:`SeedField`.
+
+    Args:
+        space: Scalar-valued function space of the field being stood in for.
+        space_partition: Space partition associated with the original field.
+        domain: Domain over which the integrand is evaluated.
+    """
+
+    def __init__(self, space: FunctionSpace, space_partition: SpacePartition, domain: GeometryDomain):
+        if space.NODE_DOF_COUNT != 1 or space.VALUE_DOF_COUNT != 1:
+            raise NotImplementedError("ValueInjectedField is only implemented for scalar-valued function spaces")
+
+        super().__init__(space, space_partition, domain)
+
+    @classmethod
+    def from_field(cls, field: SpaceField, domain: GeometryDomain) -> "ValueInjectedField":
+        """Build a :class:`ValueInjectedField` standing in for an existing discrete field."""
+        return cls(field.space, field.space_partition, domain)
+
+    @wp.func
+    def _get_dof(s: Any):
+        return s.trial_dof
+
+    def _make_eval_arg(self):
+        @cache.dynamic_struct(suffix=self.name)
+        class EvalArg:
+            value: self.dtype
+            gradient: self.gradient_dtype
+
+        return EvalArg
+
+    def fill_eval_arg(self, arg, device):
+        # The value and gradient members are written in-kernel; nothing to fill host-side.
+        pass
+
+    def _make_eval_inner(self):
+        @cache.dynamic_func(suffix=self.name)
+        def eval_value_inner(args: self.ElementEvalArg, s: self.SampleType):
+            return args.eval_arg.value
+
+        return eval_value_inner
+
+    def _make_eval_grad_inner(self):
+        if not self.gradient_valid():
+            return None
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_grad_inner(args: self.ElementEvalArg, s: self.SampleType):
+            return args.eval_arg.gradient
+
+        return eval_grad_inner
+
+    def _make_eval_div_inner(self):
+        # Divergence injection is not defined for scalar spaces
+        return None
+
+    def _make_eval_outer(self):
+        # Injected values do not distinguish inner from outer evaluation (cell domains only)
+        return self.eval_inner
+
+    def _make_eval_grad_outer(self):
+        return self.eval_grad_inner
+
+    def _make_eval_div_outer(self):
+        return None
+
+
+class SideSeedField(SeedField):
+    """Side-domain sibling of :class:`SeedField` with separate inner and outer trace seeds.
+
+    On a side (DG face) domain, a form that is linear in the test function
+    accesses it through up to ``2 * (1 + d)`` independent trace channels:
+    inner value, inner gradient, outer value, and outer gradient
+    (``jump``/``average``/``grad_jump``/``grad_average`` are linear
+    combinations of those). The seed selector carried by ``Sample.test_dof``
+    enumerates them as
+
+    * ``0``: inner value seed (``inner(v) = 1``),
+    * ``1 + i``: inner gradient seed (``grad(v) = e_i``, spatial axis ``i``),
+    * ``1 + d``: outer value seed (``outer(v) = 1``),
+    * ``2 + d + i``: outer gradient seed (``grad_outer(v) = e_i``).
+
+    All other channels evaluate to zero, so each seeded evaluation of the
+    integrand extracts exactly one trace-channel coefficient. The injected
+    gradients are expressed in the frame chosen by the consumer (the
+    sum-factorized side kernel seeds *physical* unit vectors and maps the
+    extracted coefficients back to reference space itself).
+
+    Args:
+        space: Scalar-valued (trace) function space of the test function.
+        space_partition: Space partition associated with the test function.
+        domain: Side domain over which the seeded integrand is evaluated.
+    """
+
+    def _make_eval_grad_inner(self):
+        if not self.gradient_valid():
+            return None
+
+        value_type = self.dtype
+        gradient_type = self.gradient_dtype
+        GRAD_DIM = self.geometry.dimension
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_seed_grad_inner(args: self.ElementEvalArg, s: self.SampleType):
+            seed_index = get_node_index_in_element(self._get_dof(s))
+            grad_seed = gradient_type()
+            for i in range(GRAD_DIM):
+                grad_seed[i] = wp.where(seed_index == i + 1, value_type(1.0), value_type(0.0))
+            return grad_seed
+
+        return eval_seed_grad_inner
+
+    def _make_eval_outer(self):
+        value_type = self.dtype
+        OUTER_SEED = 1 + self.geometry.dimension
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_seed_outer(args: self.ElementEvalArg, s: self.SampleType):
+            seed_index = get_node_index_in_element(self._get_dof(s))
+            return wp.where(seed_index == OUTER_SEED, value_type(1.0), value_type(0.0))
+
+        return eval_seed_outer
+
+    def _make_eval_grad_outer(self):
+        if not self.gradient_valid():
+            return None
+
+        value_type = self.dtype
+        gradient_type = self.gradient_dtype
+        GRAD_DIM = self.geometry.dimension
+        OUTER_GRAD_BEGIN = 2 + GRAD_DIM
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_seed_grad_outer(args: self.ElementEvalArg, s: self.SampleType):
+            seed_index = get_node_index_in_element(self._get_dof(s))
+            grad_seed = gradient_type()
+            for i in range(GRAD_DIM):
+                grad_seed[i] = wp.where(seed_index == OUTER_GRAD_BEGIN + i, value_type(1.0), value_type(0.0))
+            return grad_seed
+
+        return eval_seed_grad_outer
+
+
+class SideTraceInjectedField(AdjointField):
+    """Side-domain sibling of :class:`ValueInjectedField` with separate inner and outer traces.
+
+    ``eval_inner``/``eval_grad_inner`` return the ``inner_value``/
+    ``inner_gradient`` members of the :class:`EvalArg` and
+    ``eval_outer``/``eval_grad_outer`` the ``outer_*`` members, instead of
+    evaluating trace shape functions against degrees of freedom. The fused
+    sum-factorized side kernel computes the four traces of the input field at
+    each face quadrature point with tile contractions, then fills a fresh
+    local ``EvalArg`` before invoking the transformed integrand, so the user's
+    integrand body (including ``jump``/``average`` combinations) is reused
+    verbatim.
+
+    Only scalar-valued spaces are supported, mirroring
+    :class:`ValueInjectedField`.
+
+    Args:
+        space: Scalar-valued (trace) function space of the field being stood in for.
+        space_partition: Space partition associated with the original field.
+        domain: Side domain over which the integrand is evaluated.
+    """
+
+    def __init__(self, space: FunctionSpace, space_partition: SpacePartition, domain: GeometryDomain):
+        if space.NODE_DOF_COUNT != 1 or space.VALUE_DOF_COUNT != 1:
+            raise NotImplementedError("SideTraceInjectedField is only implemented for scalar-valued function spaces")
+
+        super().__init__(space, space_partition, domain)
+
+    @classmethod
+    def from_field(cls, field: SpaceField, domain: GeometryDomain) -> "SideTraceInjectedField":
+        """Build a :class:`SideTraceInjectedField` standing in for an existing discrete trace field."""
+        return cls(field.space, field.space_partition, domain)
+
+    @wp.func
+    def _get_dof(s: Any):
+        return s.trial_dof
+
+    def _make_eval_arg(self):
+        @cache.dynamic_struct(suffix=self.name)
+        class EvalArg:
+            inner_value: self.dtype
+            inner_gradient: self.gradient_dtype
+            outer_value: self.dtype
+            outer_gradient: self.gradient_dtype
+
+        return EvalArg
+
+    def fill_eval_arg(self, arg, device):
+        # The trace members are written in-kernel; nothing to fill host-side.
+        pass
+
+    def _make_eval_inner(self):
+        @cache.dynamic_func(suffix=self.name)
+        def eval_trace_inner(args: self.ElementEvalArg, s: self.SampleType):
+            return args.eval_arg.inner_value
+
+        return eval_trace_inner
+
+    def _make_eval_grad_inner(self):
+        if not self.gradient_valid():
+            return None
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_trace_grad_inner(args: self.ElementEvalArg, s: self.SampleType):
+            return args.eval_arg.inner_gradient
+
+        return eval_trace_grad_inner
+
+    def _make_eval_div_inner(self):
+        # Divergence injection is not defined for scalar spaces
+        return None
+
+    def _make_eval_outer(self):
+        @cache.dynamic_func(suffix=self.name)
+        def eval_trace_outer(args: self.ElementEvalArg, s: self.SampleType):
+            return args.eval_arg.outer_value
+
+        return eval_trace_outer
+
+    def _make_eval_grad_outer(self):
+        if not self.gradient_valid():
+            return None
+
+        @cache.dynamic_func(suffix=self.name)
+        def eval_trace_grad_outer(args: self.ElementEvalArg, s: self.SampleType):
+            return args.eval_arg.outer_gradient
+
+        return eval_trace_grad_outer
+
+    def _make_eval_div_outer(self):
+        return None
+
+
 class LocalAdjointField(SpaceField):
     """
     A custom field specially for dispatched assembly.
@@ -969,7 +1338,8 @@ def make_bilinear_dispatch_kernel(
 
         if trial_node >= element_trial_node_count:
             block_offset = test_node_offset * max_nodes_per_element + trial_node
-            triplet_rows[block_offset] = NULL_NODE_INDEX
+            if triplet_rows:
+                triplet_rows[block_offset] = NULL_NODE_INDEX
             triplet_cols[block_offset] = NULL_NODE_INDEX
             return
 
@@ -1111,7 +1481,8 @@ def make_bilinear_dispatch_kernel(
             else:
                 trial_node_index = NULL_NODE_INDEX  # will get ignored when converting to bsr
 
-            triplet_rows[block_offset] = test_node_index
+            if triplet_rows:
+                triplet_rows[block_offset] = test_node_index
             triplet_cols[block_offset] = trial_node_index
 
     return dispatch_bilinear_kernel_fn
